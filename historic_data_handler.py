@@ -1,6 +1,12 @@
 """
 PART 1: Historic Data Loading & Alignment Module (PERIOD-BASED VERSION)
 Handles loading historic records and features, organizing by PERIODS instead of years
+
+✅ UPDATED: Monthly-specific feature support
+- get_period_feature() now accepts optional 'month' parameter
+- get_historic_feature() is a new method supporting month-specific lookups
+- detect_feature_variability() reports which features are Annual vs Monthly
+- load_historic_features() reports variability on load
 """
 
 import pandas as pd
@@ -26,7 +32,7 @@ class HistoricPeriod:
         self.monthly_data = {}  # {month_name: vq_value}
         self.annual_total = None
         self.features = {}  # {feature_name: value} - period-level features
-        self.monthly_features = {}  # {month_name: {feature_name: value}} - NEW!
+        self.monthly_features = {}  # {month_name: {feature_name: value}}
 
         # Metadata
         self.months_covered = 0
@@ -67,13 +73,18 @@ class HistoricPeriod:
         """
         Get annual feature value, detecting if monthly values are repeated (annual) or different (monthly sum).
         Returns: (value, is_repeated)
+
+        is_repeated meanings:
+            True  - same value every month (e.g. annual SqFt repeated across rows)
+            False - varies by month (e.g. monthly Turnover)
+            None  - insufficient data to determine (fall back to period-level)
+
+        FIXED: requires at least 6 months of data before classifying as 'repeated'.
+        With fewer months, a single stored value would falsely look like a constant.
         """
-        # Check if we have monthly feature data
         if not self.monthly_features:
-            # Fall back to period-level feature
             return self.features.get(feature_name), None
 
-        # Collect monthly values
         monthly_values = []
         for month in self.monthly_features:
             val = self.monthly_features[month].get(feature_name)
@@ -81,16 +92,20 @@ class HistoricPeriod:
                 monthly_values.append(val)
 
         if not monthly_values:
-            return None, None
+            return self.features.get(feature_name), None
 
-        # Check if all values are the same (within small tolerance for floating point)
         unique_values = set(round(v, 2) if isinstance(v, (int, float)) else v for v in monthly_values)
 
         if len(unique_values) == 1:
-            # All same → This is an annual value repeated
-            return monthly_values[0], True
+            if len(monthly_values) >= 6:
+                # Enough months with identical value - confidently annual/repeated
+                return monthly_values[0], True
+            else:
+                # Too few months stored to be sure - treat as unknown
+                # so per-month lookup is used in the YoY sheet
+                return monthly_values[0], None
         else:
-            # Different → Sum to get annual total
+            # Values differ across months - monthly-varying
             return sum(monthly_values), False
 
     def get_monthly_average(self):
@@ -122,6 +137,8 @@ class HistoricDataManager:
     """
     Manages historic data using PERIODS instead of years.
     A period represents a contiguous span of time with VQ data.
+
+    ✅ UPDATED: Monthly-specific feature support throughout.
     """
 
     def __init__(self):
@@ -177,12 +194,10 @@ class HistoricDataManager:
                 break
 
         if fy_column and current_df[fy_column].notna().any():
-            # Use FY column (most common value)
             fy_values = current_df[fy_column].dropna()
             from collections import Counter
             most_common_fy = Counter(fy_values).most_common(1)[0][0]
 
-            # Extract numeric year from FY (e.g., "FY2025" → 2025)
             if isinstance(most_common_fy, str):
                 match = re.search(r'(\d{4})', str(most_common_fy))
                 if match:
@@ -198,7 +213,6 @@ class HistoricDataManager:
             print(f"\n🗓️  Detected current period: {self.current_fy_label} (FY column)")
             print(f"   Financial year identifier: {self.current_year}")
 
-            # Store that we're using FY-based logic
             self.use_fy_logic = True
             return self.current_year
 
@@ -217,7 +231,6 @@ class HistoricDataManager:
             self.current_year = year_counts.most_common(1)[0][0]
             self.current_fy_label = f"{self.current_year}"
 
-            # Find date range
             min_date = min(dates)
             max_date = max([self.parse_dates(d) for d in current_df['Date to'].dropna()])
 
@@ -241,32 +254,26 @@ class HistoricDataManager:
         print("LOADING HISTORIC RECORDS (PERIOD-BASED)")
         print("=" * 70)
 
-        # Load file
         if filepath.endswith('.csv'):
             self.historic_records = pd.read_csv(filepath)
         else:
             self.historic_records = pd.read_excel(filepath)
 
-        # CRITICAL FIX: Strip whitespace from column names
         self.historic_records.columns = self.historic_records.columns.str.strip()
 
         print(f"✓ Loaded {len(self.historic_records)} historic records")
 
-        # Filter by GHG Category
         if ghg_category_filter:
             if isinstance(ghg_category_filter, str):
                 ghg_category_filter = [ghg_category_filter]
 
-            before_count = len(self.historic_records)
             self.historic_records = self.historic_records[
                 self.historic_records['GHG Category'].isin(ghg_category_filter)
             ]
             print(f"✓ Filtered to {len(self.historic_records)} records matching GHG categories")
 
-        # Organize into periods
         self._organize_into_periods()
 
-        # Extract historic years
         self.historic_years = sorted(list(set([p.year for periods in self.site_periods.values() for p in periods])))
         print(f"✓ Detected {len(self.historic_years)} historic years: {self.historic_years}")
 
@@ -279,7 +286,6 @@ class HistoricDataManager:
         """
         print("\n📅 Organizing data into periods...")
 
-        # Check if Year/FY column exists - use that instead of dates if available
         year_column = None
         for col in self.historic_records.columns:
             if col in ['Year', 'year', 'FY', 'fy', 'Financial Year', 'financial_year']:
@@ -297,16 +303,13 @@ class HistoricDataManager:
         """Organize historic records using explicit Year/FY column"""
         import re
 
-        # Group by site
         site_groups = self.historic_records.groupby('Site identifier')
 
         for site, site_data in site_groups:
-            # Group by year within site
             for year_val in site_data[year_column].unique():
                 if pd.isna(year_val):
                     continue
 
-                # Extract numeric year from FY2024 format
                 if isinstance(year_val, str):
                     match = re.search(r'(\d{4})', year_val)
                     if match:
@@ -316,20 +319,17 @@ class HistoricDataManager:
                 else:
                     year = int(year_val)
 
-                # Skip current year
                 if year == self.current_year:
                     continue
 
                 year_data = site_data[site_data[year_column] == year_val]
 
-                # Create period for this year
                 first_row = year_data.iloc[0]
                 date_from = self.parse_dates(first_row['Date from'])
                 date_to = self.parse_dates(first_row['Date to'])
 
                 period = HistoricPeriod(site, date_from, date_to)
 
-                # Add all VQ data for this year
                 for idx, row in year_data.iterrows():
                     vq = row.get('Volumetric Quantity')
                     if pd.isna(vq):
@@ -349,11 +349,9 @@ class HistoricDataManager:
 
                 self.site_periods[site].append(period)
 
-        # Summary
         total_periods = sum(len(periods) for periods in self.site_periods.values())
         print(f"✓ Organized into {total_periods} periods across {len(self.site_periods)} sites")
 
-        # Show examples
         for site in list(self.site_periods.keys())[:3]:
             periods = self.site_periods[site]
             print(f"  • {site}: {len(periods)} periods")
@@ -365,21 +363,17 @@ class HistoricDataManager:
         """Organize historic records by extracting year from Date columns"""
         import re
 
-        # Check if FY column exists in historic records
         fy_column = None
         for col in self.historic_records.columns:
             if col in ['FY', 'fy', 'Financial Year', 'financial_year', 'Financial_Year']:
                 fy_column = col
                 break
 
-        # Group by site
         site_groups = self.historic_records.groupby('Site identifier')
 
         for site, site_data in site_groups:
-            # Sort by date
             site_data = site_data.sort_values('Date from')
 
-            # Detect periods (groups of contiguous monthly data or annual records)
             current_period = None
 
             for idx, row in site_data.iterrows():
@@ -387,16 +381,11 @@ class HistoricDataManager:
                 date_to = self.parse_dates(row['Date to'])
                 vq = row.get('Volumetric Quantity')
 
-                # Skip if no VQ
                 if pd.isna(vq):
                     continue
 
-                # CRITICAL: Skip current period data
-                # If FY column exists, use FY comparison (handles financial years correctly)
-                # Otherwise, fall back to calendar year comparison
                 should_skip = False
                 if fy_column and pd.notna(row.get(fy_column)):
-                    # Extract year from FY column
                     fy_val = row[fy_column]
                     if isinstance(fy_val, str):
                         match = re.search(r'(\d{4})', fy_val)
@@ -406,7 +395,6 @@ class HistoricDataManager:
                     else:
                         should_skip = (int(fy_val) == self.current_year)
                 else:
-                    # Fallback: Use calendar year from date
                     should_skip = (date_from.year == self.current_year)
 
                 if should_skip:
@@ -414,35 +402,26 @@ class HistoricDataManager:
 
                 timeframe, month = self.determine_timeframe(date_from, date_to)
 
-                # Start new period if needed
                 if current_period is None or date_from.year != current_period.year:
                     if current_period is not None:
                         self.site_periods[site].append(current_period)
-
-                    # Create new period
                     current_period = HistoricPeriod(site, date_from, date_to)
 
-                # Add data to period
                 if timeframe == 'Monthly' and month:
                     current_period.add_monthly_vq(month, vq)
-                    # Update period end date
                     if date_to > current_period.end_date:
                         current_period.end_date = date_to
-
                 elif timeframe == 'Annual':
                     current_period.set_annual_total(vq)
                     current_period.start_date = date_from
                     current_period.end_date = date_to
 
-            # Add final period
             if current_period is not None:
                 self.site_periods[site].append(current_period)
 
-        # Summary
         total_periods = sum(len(periods) for periods in self.site_periods.values())
         print(f"✓ Organized into {total_periods} periods across {len(self.site_periods)} sites")
 
-        # Show examples
         for site in list(self.site_periods.keys())[:3]:
             periods = self.site_periods[site]
             print(f"  • {site}: {len(periods)} periods")
@@ -461,16 +440,13 @@ class HistoricDataManager:
         else:
             self.historic_features = pd.read_excel(filepath)
 
-        # CRITICAL FIX: Strip whitespace from column names
         self.historic_features.columns = self.historic_features.columns.str.strip()
 
         print(f"✓ Loaded historic features file with {len(self.historic_features)} rows")
         print(f"  Columns: {list(self.historic_features.columns)}")
 
-        # Convert numeric columns that might be stored as text
         self._convert_numeric_features()
 
-        # Detect format - check for year column (various names)
         year_column = None
         for col in self.historic_features.columns:
             if col in ['Year', 'year', 'FY', 'fy', 'Financial Year', 'financial_year']:
@@ -487,11 +463,20 @@ class HistoricDataManager:
             print("✓ Detected Format 1: Year suffix in column names")
             self._attach_features_format1()
 
+        # ✅ NEW: Detect and report feature variability (Annual vs Monthly)
+        feature_types = self.detect_feature_variability()
+        if feature_types:
+            print("\n📊 Feature Variability Analysis:")
+            for feature, ftype in sorted(feature_types.items()):
+                icon = "📅" if "Monthly" in ftype else "📆" if "Annual" in ftype else "🔀"
+                print(f"  {icon} {feature}: {ftype}")
+        else:
+            print("\n⚠️  No feature variability data available")
+
         return self.historic_features
 
     def _convert_numeric_features(self):
         """Convert numeric columns in historic features that might be stored as text"""
-        # Known numeric feature names
         numeric_keywords = ['turnover', 'transaction', 'revenue', 'sales',
                             'square', 'footage', 'floor', 'space', 'sqft']
 
@@ -499,11 +484,9 @@ class HistoricDataManager:
             if col == 'Site identifier' or col == 'Year':
                 continue
 
-            # Skip if already numeric
             if pd.api.types.is_numeric_dtype(self.historic_features[col]):
                 continue
 
-            # Check if column name suggests numeric
             col_lower = col.lower()
             should_be_numeric = any(keyword in col_lower for keyword in numeric_keywords)
 
@@ -536,7 +519,6 @@ class HistoricDataManager:
         print(f"✓ Detected {len(base_features)} features: {sorted(base_features)}")
         print(f"✓ Detected {len(feature_years)} years: {sorted(feature_years)}")
 
-        # Attach to periods
         for idx, row in self.historic_features.iterrows():
             site = row.get('Site identifier')
             if pd.isna(site) or site not in self.site_periods:
@@ -553,7 +535,6 @@ class HistoricDataManager:
                     value = row[col]
 
                     if pd.notna(value):
-                        # Find matching period
                         for period in self.site_periods[site]:
                             if period.year == year:
                                 period.add_feature(feature_name, value)
@@ -561,61 +542,138 @@ class HistoricDataManager:
         print(f"✓ Attached features to periods")
 
     def _attach_features_format2(self, year_column='Year'):
-        """Attach features with Year/FY column"""
+        """
+        Attach features with Year/FY column.
+
+        ✅ FIXED: If the file also has Date from/Date to columns (i.e. one row per month),
+        features are stored monthly using add_monthly_feature() so that month-varying
+        values (e.g. Turnover) are preserved rather than overwritten by the last row.
+
+        After all rows are processed, any feature whose monthly values are all identical
+        is also promoted to period.features (annual level) for fast annual lookups.
+        """
+        import re
+
+        has_dates = ('Date from' in self.historic_features.columns and
+                     'Date to' in self.historic_features.columns)
+
         feature_columns = [col for col in self.historic_features.columns
-                           if col not in ['Site identifier', year_column, 'Location', 'Date from', 'Date to']]
+                           if col not in ['Site identifier', year_column, 'Location',
+                                          'Date from', 'Date to']]
 
         if not feature_columns:
             print("⚠️  No feature columns found (only metadata columns present)")
             return
 
         print(f"✓ Detected {len(feature_columns)} features: {feature_columns}")
+        if has_dates:
+            print("  ℹ️  Date from/Date to present — storing features monthly to preserve variation")
 
         years_detected = set()
 
         for idx, row in self.historic_features.iterrows():
             site = row.get('Site identifier')
-            year = row.get(year_column)
+            year_raw = row.get(year_column)
 
-            if pd.isna(site) or pd.isna(year) or site not in self.site_periods:
+            if pd.isna(site) or pd.isna(year_raw) or site not in self.site_periods:
                 continue
 
-            # Handle FY2024 format - extract numeric year
-            if isinstance(year, str):
-                # Try to extract year from strings like "FY2024", "2024", "fy2024"
-                import re
-                match = re.search(r'(\d{4})', year)
+            # Parse year (handles "FY2024", 2024, etc.)
+            if isinstance(year_raw, str):
+                match = re.search(r'(\d{4})', year_raw)
                 if match:
                     year = int(match.group(1))
                 else:
                     continue
             else:
-                year = int(year)
+                year = int(year_raw)
 
             years_detected.add(year)
 
             # Find matching period
+            target_period = None
             for period in self.site_periods[site]:
                 if period.year == year:
-                    for feature in feature_columns:
-                        value = row[feature]
-                        if pd.notna(value):
-                            period.add_feature(feature, value)
+                    target_period = period
+                    break
+
+            if target_period is None:
+                continue
+
+            if has_dates:
+                # Parse month from Date from so we store features per-month
+                date_from_raw = row.get('Date from')
+                month_name = None
+                if pd.notna(date_from_raw):
+                    try:
+                        if isinstance(date_from_raw, str):
+                            for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y']:
+                                try:
+                                    month_name = datetime.strptime(date_from_raw, fmt).strftime('%B')
+                                    break
+                                except ValueError:
+                                    continue
+                            if month_name is None:
+                                month_name = pd.to_datetime(date_from_raw, dayfirst=True).strftime('%B')
+                        elif hasattr(date_from_raw, 'strftime'):
+                            month_name = date_from_raw.strftime('%B')
+                    except Exception:
+                        month_name = None
+
+                for feature in feature_columns:
+                    value = row[feature]
+                    if pd.notna(value):
+                        if month_name:
+                            target_period.add_monthly_feature(month_name, feature, value)
+                        else:
+                            # Can't determine month — store at period level as fallback
+                            target_period.add_feature(feature, value)
+            else:
+                # No date columns — single row per site/year, store at period level
+                for feature in feature_columns:
+                    value = row[feature]
+                    if pd.notna(value):
+                        target_period.add_feature(feature, value)
+
+        # ✅ Post-process: for monthly-stored features that are actually constant
+        # across all months, also write to period.features for fast annual lookups
+        if has_dates:
+            promoted = 0
+            for site, periods in self.site_periods.items():
+                for period in periods:
+                    if not period.monthly_features:
+                        continue
+                    # Collect all feature names stored monthly
+                    all_monthly_feat_names = set(
+                        f for mf in period.monthly_features.values() for f in mf.keys()
+                    )
+                    for feat_name in all_monthly_feat_names:
+                        vals = [
+                            period.monthly_features[m][feat_name]
+                            for m in period.monthly_features
+                            if feat_name in period.monthly_features[m]
+                        ]
+                        if len(vals) > 0:
+                            unique = set(round(v, 2) if isinstance(v, (int, float)) else v for v in vals)
+                            if len(unique) == 1:
+                                # Constant — promote to period level
+                                if feat_name not in period.features:
+                                    period.add_feature(feat_name, vals[0])
+                                    promoted += 1
+            if promoted:
+                print(f"  ✓ Promoted {promoted} constant monthly features to period level")
 
         print(f"✓ Detected {len(years_detected)} years: {sorted(years_detected)}")
-        print(f"✓ Attached features to periods")
-
         print(f"✓ Attached features to periods")
 
     def _attach_features_format2_dates(self):
         """
         Attach features from format with 'Date from' and 'Date to' columns.
         Extracts year and month from dates and matches to periods.
-        NOW stores features PER MONTH for proper month-by-month comparison.
+        Stores features PER MONTH for proper month-by-month comparison.
         """
         from datetime import datetime
 
-        # Get feature columns (exclude metadata)
         exclude_cols = ['Site identifier', 'Location', 'Date from', 'Date to', 'Year', 'Financial Year']
         feature_columns = [col for col in self.historic_features.columns
                            if col not in exclude_cols]
@@ -626,7 +684,6 @@ class HistoricDataManager:
 
         print(f"✓ Detected {len(feature_columns)} features: {feature_columns}")
 
-        # Parse dates and extract years
         years_detected = set()
 
         for idx, row in self.historic_features.iterrows():
@@ -634,26 +691,22 @@ class HistoricDataManager:
             if pd.isna(site) or site not in self.site_periods:
                 continue
 
-            # Parse Date from to get year AND month
             date_from = row.get('Date from')
             date_to = row.get('Date to')
             if pd.isna(date_from):
                 continue
 
             try:
-                # Try to parse date
                 if isinstance(date_from, str):
-                    # Try common formats
                     for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y']:
                         try:
                             date_from_obj = datetime.strptime(date_from, fmt)
                             year = date_from_obj.year
-                            month_name = date_from_obj.strftime('%B')  # Full month name
+                            month_name = date_from_obj.strftime('%B')
                             break
                         except:
                             continue
                     else:
-                        # Try pandas
                         date_from_obj = pd.to_datetime(date_from, dayfirst=True)
                         year = date_from_obj.year
                         month_name = date_from_obj.strftime('%B')
@@ -663,30 +716,10 @@ class HistoricDataManager:
                 else:
                     continue
 
-                # Also parse date_to to check if monthly or annual
-                try:
-                    if isinstance(date_to, str):
-                        for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y']:
-                            try:
-                                date_to_obj = datetime.strptime(date_to, fmt)
-                                break
-                            except:
-                                continue
-                        else:
-                            date_to_obj = pd.to_datetime(date_to, dayfirst=True)
-                    elif hasattr(date_to, 'year'):
-                        date_to_obj = date_to
-                    else:
-                        date_to_obj = None
-                except:
-                    date_to_obj = None
-
                 years_detected.add(year)
 
-                # Find matching period
                 for period in self.site_periods[site]:
                     if period.year == year:
-                        # Store features for this specific month
                         for feature in feature_columns:
                             value = row[feature]
                             if pd.notna(value):
@@ -698,6 +731,158 @@ class HistoricDataManager:
         print(f"✓ Detected {len(years_detected)} years: {sorted(years_detected)}")
         print(f"✓ Attached features to periods (monthly tracking enabled)")
 
+    # =========================================================================
+    # ✅ NEW: Feature Variability Detection
+    # =========================================================================
+
+    def detect_feature_variability(self):
+        """
+        Detect which features are annual (repeated) vs monthly (varying).
+
+        Checks each feature across all sites and periods:
+        - If a site has the same Turnover every month → 'Annual (Repeated)'
+        - If a site has different Turnover each month → 'Monthly (Varying)'
+        - If it varies by site → 'Mixed'
+
+        Returns:
+        --------
+        dict: {feature_name: 'Annual (Repeated)' | 'Monthly (Varying)' | 'Mixed'}
+        """
+        feature_analysis = {}  # {feature_name: {'annual': 0, 'monthly': 0}}
+
+        for site, periods in self.site_periods.items():
+            for period in periods:
+                # Collect all feature names from both period-level and monthly features
+                all_feature_names = set(period.features.keys())
+                for month_features in period.monthly_features.values():
+                    all_feature_names.update(month_features.keys())
+
+                for feature_name in all_feature_names:
+                    if feature_name not in feature_analysis:
+                        feature_analysis[feature_name] = {'annual': 0, 'monthly': 0}
+
+                    # Use get_annual_feature which already handles the
+                    # repeated vs varying logic
+                    annual_val, is_repeated = period.get_annual_feature(feature_name)
+
+                    if annual_val is None:
+                        continue
+
+                    if is_repeated is True:
+                        feature_analysis[feature_name]['annual'] += 1
+                    elif is_repeated is False:
+                        feature_analysis[feature_name]['monthly'] += 1
+                    else:
+                        # is_repeated is None → came from period-level only (no monthly data)
+                        # Treat as annual
+                        feature_analysis[feature_name]['annual'] += 1
+
+        # Classify each feature
+        result = {}
+        for feature_name, counts in feature_analysis.items():
+            total = counts['annual'] + counts['monthly']
+            if total == 0:
+                continue
+
+            annual_pct = counts['annual'] / total
+
+            if annual_pct > 0.8:
+                result[feature_name] = 'Annual (Repeated)'
+            elif annual_pct < 0.2:
+                result[feature_name] = 'Monthly (Varying)'
+            else:
+                result[feature_name] = f'Mixed ({counts["monthly"]} monthly, {counts["annual"]} annual sites)'
+
+        return result
+
+    # =========================================================================
+    # ✅ UPDATED: Feature Access Methods (now month-aware)
+    # =========================================================================
+
+    def get_period_feature(self, period, feature_name, month=None):
+        """
+        Get a feature value from a period, with optional month-specific lookup.
+
+        Priority:
+        1. If month provided → check monthly_features for that month first
+        2. Fall back to period-level features (annual / repeated value)
+
+        Parameters:
+        -----------
+        period : HistoricPeriod
+        feature_name : str
+        month : str, optional
+            Month name (e.g., 'January'). If provided, returns month-specific value.
+
+        Returns:
+        --------
+        float or None
+
+        Examples:
+        ---------
+        # Turnover varies by month - get January's value
+        jan_turnover = hdm.get_period_feature(period, 'Turnover', month='January')
+
+        # SqFt is the same all year - month doesn't matter
+        sqft = hdm.get_period_feature(period, 'SqFt')
+        """
+        if month:
+            # Try to get month-specific feature first
+            month_val = period.get_monthly_feature(month, feature_name)
+            if month_val is not None:
+                return month_val
+
+        # Fall back to period-level feature (annual or repeated value)
+        return period.features.get(feature_name)
+
+    def get_historic_feature(self, site, year, feature_name, month=None):
+        """
+        Get a historic feature value by site, year, and optionally month.
+
+        Convenience wrapper around get_period_feature() for backward compatibility
+        and easy access without needing a HistoricPeriod object.
+
+        Parameters:
+        -----------
+        site : str
+            Site identifier
+        year : int
+            Year to retrieve feature from
+        feature_name : str
+            Name of the feature (e.g., 'Turnover', 'SqFt')
+        month : str, optional
+            Month name (e.g., 'January'). If provided, returns month-specific value.
+            If not provided (or if month-specific value not available), returns
+            period-level (annual / repeated) value.
+
+        Returns:
+        --------
+        float or None
+
+        Examples:
+        ---------
+        # Monthly-varying Turnover
+        jan_2024 = hdm.get_historic_feature('Site001', 2024, 'Turnover', month='January')
+        feb_2024 = hdm.get_historic_feature('Site001', 2024, 'Turnover', month='February')
+
+        # Annual SqFt (same regardless of month)
+        sqft_2024 = hdm.get_historic_feature('Site001', 2024, 'SqFt')
+        sqft_2024_jan = hdm.get_historic_feature('Site001', 2024, 'SqFt', month='January')
+        # Both return the same value
+        """
+        if site not in self.site_periods:
+            return None
+
+        for period in self.site_periods[site]:
+            if period.year == year:
+                return self.get_period_feature(period, feature_name, month=month)
+
+        return None
+
+    # =========================================================================
+    # Existing accessor methods (unchanged)
+    # =========================================================================
+
     def get_most_recent_period(self, site, before_date):
         """
         Get the most recent historic period for a site ending before a given date.
@@ -705,9 +890,7 @@ class HistoricDataManager:
         Parameters:
         -----------
         site : str
-            Site identifier
         before_date : datetime
-            Find period ending before this date
 
         Returns:
         --------
@@ -716,13 +899,11 @@ class HistoricDataManager:
         if site not in self.site_periods:
             return None
 
-        # Filter to periods ending before the date
         eligible_periods = [p for p in self.site_periods[site] if p.end_date < before_date]
 
         if not eligible_periods:
             return None
 
-        # Return most recent
         return max(eligible_periods, key=lambda p: p.end_date)
 
     def get_all_periods(self, site):
@@ -737,7 +918,6 @@ class HistoricDataManager:
         -----------
         period : HistoricPeriod
         month : str
-            Month name (e.g., 'January')
 
         Returns:
         --------
@@ -750,10 +930,6 @@ class HistoricDataManager:
     def get_period_annual_total(self, period):
         """Get annual total from a period"""
         return period.annual_total
-
-    def get_period_feature(self, period, feature_name):
-        """Get a feature value from a period"""
-        return period.features.get(feature_name)
 
     def create_availability_matrix(self, current_df):
         """Create availability matrix for analysis"""
@@ -774,7 +950,6 @@ class HistoricDataManager:
             for month in months:
                 month_current = site_current[site_current['Month'] == month]
 
-                # Current data
                 has_current_vq = False
                 current_vq = None
                 if len(month_current) > 0:
@@ -782,16 +957,14 @@ class HistoricDataManager:
                     if has_current_vq:
                         current_vq = month_current['Volumetric Quantity'].iloc[0]
 
-                # Historic data (by year)
                 historic_availability = {}
 
                 if site in self.site_periods:
                     for period in self.site_periods[site]:
                         year = period.year
 
-                        # Check if this period has this month
                         has_month_vq = month in period.monthly_data
-                        has_features = len(period.features) > 0
+                        has_features = len(period.features) > 0 or len(period.monthly_features) > 0
 
                         historic_availability[f'{year}_VQ'] = has_month_vq
                         historic_availability[f'{year}_Features'] = has_features
@@ -799,7 +972,6 @@ class HistoricDataManager:
                         if has_month_vq:
                             historic_availability[f'{year}_VQ_Value'] = period.monthly_data[month]
 
-                # Calculate quality
                 years_with_vq = sum(1 for k, v in historic_availability.items() if k.endswith('_VQ') and v)
                 completeness_score = years_with_vq / len(self.historic_years) if self.historic_years else 0
 
@@ -833,7 +1005,6 @@ class HistoricDataManager:
         self.availability_matrix = pd.DataFrame(matrix_data)
         print(f"✓ Created availability matrix with {len(self.availability_matrix)} records")
 
-        # Summary
         quality_counts = self.availability_matrix['Data_Quality'].value_counts()
         print("\nData Quality Distribution:")
         for quality, count in quality_counts.items():
@@ -862,7 +1033,10 @@ class HistoricDataManager:
             'sites_with_periods': len(self.site_periods)
         }
 
-    # Helper methods for backward compatibility
+    # =========================================================================
+    # Backward compatibility helpers
+    # =========================================================================
+
     def get_historic_vq(self, site, year, month):
         """Get historic VQ by year and month (backward compatibility)"""
         if site not in self.site_periods:
@@ -871,14 +1045,4 @@ class HistoricDataManager:
         for period in self.site_periods[site]:
             if period.year == year and month in period.monthly_data:
                 return period.monthly_data[month]
-        return None
-
-    def get_historic_feature(self, site, year, feature):
-        """Get historic feature by year (backward compatibility)"""
-        if site not in self.site_periods:
-            return None
-
-        for period in self.site_periods[site]:
-            if period.year == year and feature in period.features:
-                return period.features[feature]
         return None

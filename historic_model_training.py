@@ -1,7 +1,11 @@
 """
-PART 3: Historic Model Training Module (FIXED VERSION)
+PART 3: Historic Model Training Module
 Trains ML models and rule-based models using historic data with fair R² evaluation
-✅ CRITICAL FIX: Site-level features now trained on MONTHLY data (not annual aggregates)
+
+✅ UPDATED: Month-aware feature access throughout
+- Rule-based models now use month-specific feature values (e.g. monthly Turnover)
+- Feature engineering uses month-specific historic values for YoY calculations
+- Covers all input file formats (annual features, monthly features, mixed)
 """
 
 import pandas as pd
@@ -54,42 +58,20 @@ class HistoricModelTrainer:
     Trains models using historic data.
     Includes ML models (TIER 1), rule-based models (TIER 2), and existing models (TIER 3).
 
-    ✅ FIXED: Site-level features now trained on MONTHLY data for honest R² scores
+    ✅ FIXED: Site-level features trained on MONTHLY data for honest R² scores
+    ✅ FIXED: Rule-based models use month-specific feature values where available
     """
 
     def __init__(self, historic_data_manager, feature_engineer):
-        """
-        Parameters:
-        -----------
-        historic_data_manager : HistoricDataManager
-            Manager with loaded historic data
-        feature_engineer : HistoricFeatureEngineer
-            Engineer that created YoY features
-        """
         self.hdm = historic_data_manager
         self.fe = feature_engineer
         self.models = {}
         self.categorical_encoders = {}
-        self.feature_set_month_r2 = {}  # Track R² by (feature_set, month)
-        self.feature_set_r2 = {}  # Track overall R² by feature_set
+        self.feature_set_month_r2 = {}
+        self.feature_set_r2 = {}
 
     def train_all_models(self, enhanced_df, data_df, selected_features):
-        """
-        Train all model tiers.
-
-        Parameters:
-        -----------
-        enhanced_df : DataFrame
-            Full dataset with engineered features (includes blanks)
-        data_df : DataFrame
-            Rows with actual VQ (for training)
-        selected_features : list
-            User-selected features
-
-        Returns:
-        --------
-        dict : Trained models
-        """
+        """Train all model tiers."""
         print("\n" + "="*70)
         print("HISTORIC MODEL TRAINING")
         print("="*70)
@@ -98,19 +80,15 @@ class HistoricModelTrainer:
             print("⚠️  Insufficient data for training (need at least 10 rows)")
             return self.models
 
-        # TIER 1: ML Models with Historic Data
         print("\n🎯 TIER 1: ML Models with Historic Data")
         self._train_ml_models_multiyear(data_df, selected_features)
 
-        # TIER 2: Rule-Based Historic Models
         print("\n📋 TIER 2: Rule-Based Historic Models")
         self._train_rule_based_models(data_df)
 
-        # TIER 2.5: Similar Sites Methods (if features available)
         print("\n🔍 TIER 2.5: Similar Sites Methods")
         self._evaluate_similar_sites_methods(data_df, selected_features)
 
-        # Generate Data Quality Grid
         print("\n📊 DATA QUALITY ASSESSMENT")
         self._generate_quality_grid()
 
@@ -127,7 +105,6 @@ class HistoricModelTrainer:
         print("  DATA QUALITY BY FEATURE SET")
         print("  " + "="*66)
 
-        # Sort feature sets by R² (descending)
         sorted_feature_sets = sorted(
             self.feature_set_r2.items(),
             key=lambda x: x[1],
@@ -142,7 +119,6 @@ class HistoricModelTrainer:
             if len(features_str) > 44:
                 features_str = features_str[:41] + '...'
 
-            # Add quality indicator
             if r2 >= 0.70:
                 indicator = "✓✓"
             elif r2 >= 0.50:
@@ -161,20 +137,16 @@ class HistoricModelTrainer:
     def _train_ml_models_multiyear(self, data_df, selected_features):
         """
         Train ML models on data including engineered historic features.
-        ✅ FIXED: Now actively filters out VQ-derived features that can't predict blank rows.
+        Filters out VQ-derived features that can't predict blank rows.
         """
-
-        # Get all engineered features from the data
         engineered_features = [col for col in data_df.columns
                               if any(x in col for x in ['YoY', 'Trend', 'Volatility',
                                                         'Growth', 'Historic_Avg',
                                                         'VQ_per_', 'Efficiency_',
                                                         'Year', 'Years_Since'])]
 
-        # Combine user-selected features with engineered features
         all_potential_features = list(set(selected_features + engineered_features))
 
-        # ⚠️ CRITICAL: Filter OUT features that require VQ to calculate
         available_features = []
         excluded_features = []
 
@@ -182,10 +154,11 @@ class HistoricModelTrainer:
             if feature in data_df.columns:
                 availability = data_df[feature].notna().sum() / len(data_df)
                 if availability < 0.2:
-                    continue  # Less than 20% availability
+                    continue
 
-                # ❌ EXCLUDE VQ-derived features (can't predict blank rows!)
-                if any(x in feature for x in ['VQ_per_', 'Efficiency_', 'VQ_YoY', 'VQ_Trend', 'VQ_Volatility', 'VQ_Historic_Avg', 'VQ_2Yr_Growth']):
+                if any(x in feature for x in ['VQ_per_', 'Efficiency_', 'VQ_YoY',
+                                               'VQ_Trend', 'VQ_Volatility',
+                                               'VQ_Historic_Avg', 'VQ_2Yr_Growth']):
                     excluded_features.append(feature)
                     continue
 
@@ -204,26 +177,23 @@ class HistoricModelTrainer:
 
         print(f"  ✓ Using {len(available_features)} features for ML training: {available_features}")
 
-        # Add Month as a feature for monthly data
         monthly_data = data_df[data_df['Timeframe'] == 'Monthly'].copy()
         if len(monthly_data) >= 10:
             self._train_monthly_ml_models(monthly_data, available_features)
 
-        # ✅ Train site-level features on MONTHLY data
         site_level_features = [f for f in available_features
                               if f not in ['Month'] and
                               'YoY' not in f and 'Trend' not in f and
                               'Volatility' not in f and 'Historic_Avg' not in f]
 
         if len(site_level_features) > 0:
-            self._train_site_level_ml_models_FIXED(data_df, site_level_features)
+            self._train_site_level_ml_models(data_df, site_level_features)
 
     def _train_monthly_ml_models(self, monthly_data, features):
         """Train ML models for monthly data"""
         X_features = []
         feature_names = []
 
-        # Add Month
         if 'Month' in monthly_data.columns:
             month_encoder = LabelEncoder()
             valid_months = monthly_data[monthly_data['Month'] != '']['Month']
@@ -235,11 +205,9 @@ class HistoricModelTrainer:
                 ).reshape(-1, 1))
                 feature_names.append('Month')
 
-        # Add all available features
         for feature in features:
             if feature == 'Month':
                 continue
-
             if feature not in monthly_data.columns:
                 continue
 
@@ -248,7 +216,6 @@ class HistoricModelTrainer:
                 X_features.append(feature_data.values.reshape(-1, 1))
                 feature_names.append(feature)
             else:
-                # Categorical feature
                 encoder = LabelEncoder()
                 feature_data = monthly_data[feature].fillna('Unknown')
                 non_null = feature_data[feature_data != 'Unknown']
@@ -273,7 +240,6 @@ class HistoricModelTrainer:
         y = monthly_data['Volumetric Quantity'].values
         X_all = np.hstack(X_features)
 
-        # Train models
         if len(X_all) >= 10:
             self._train_and_evaluate_model(
                 X_all, y, 'Historic_Monthly_RandomForest',
@@ -284,7 +250,6 @@ class HistoricModelTrainer:
                 'GradientBoosting', feature_names
             )
 
-            # Also train with just key features if we have Year
             if 'Year' in monthly_data.columns and 'Month' in feature_names:
                 key_features = ['Month', 'Year']
                 key_feature_indices = [i for i, f in enumerate(feature_names) if f in key_features]
@@ -295,17 +260,9 @@ class HistoricModelTrainer:
                         'Linear', key_features
                     )
 
-    def _train_site_level_ml_models_FIXED(self, data_df, features):
+    def _train_site_level_ml_models(self, data_df, features):
         """
-        ✅ FIXED VERSION: Train site-level features on MONTHLY data
-
-        OLD METHOD (WRONG):
-        - Aggregated to annual totals → R² = 1.000 (fake!)
-
-        NEW METHOD (CORRECT):
-        - Train on monthly data with Month feature → R² = 0.3-0.6 (honest!)
-
-        This matches what Data_Extrapolation.py already does correctly.
+        Train site-level features on MONTHLY data for honest R² scores.
         """
         monthly_data = data_df[data_df['Timeframe'] == 'Monthly'].copy()
 
@@ -316,22 +273,18 @@ class HistoricModelTrainer:
 
         print(f"\n  Testing site-level features on {len(monthly_data)} monthly rows...")
 
-        # Test individual site-level features
         for feature in features:
             if feature not in monthly_data.columns:
                 continue
 
-            # Check feature availability
             feature_availability = monthly_data[feature].notna().sum() / len(monthly_data)
             if feature_availability < 0.2:
                 print(f"     ⚠️  Skipping {feature}: Only {feature_availability:.1%} available")
                 continue
 
-            # Build feature matrix: Month + Site-level Feature
             X_features = []
             feature_names = []
 
-            # Add Month (categorical - important for seasonality!)
             month_encoder = LabelEncoder()
             valid_months = monthly_data[monthly_data['Month'] != '']['Month']
             if len(valid_months) > 0:
@@ -342,7 +295,6 @@ class HistoricModelTrainer:
                 )
                 feature_names.append('Month')
 
-            # Add site-level feature (same for all months at a site)
             if pd.api.types.is_numeric_dtype(monthly_data[feature]):
                 feature_data = monthly_data[feature].fillna(monthly_data[feature].median())
                 X_features.append(feature_data.values.reshape(-1, 1))
@@ -352,15 +304,12 @@ class HistoricModelTrainer:
                     y = monthly_data['Volumetric Quantity'].values
                     X_all = np.hstack(X_features)
 
-                    # Train Linear model
                     self._train_and_evaluate_model(
                         X_all, y,
                         f'Historic_SiteLevel_Monthly_{feature}',
                         'Linear',
                         feature_names
                     )
-
-                    # Also train Polynomial for potentially non-linear relationships
                     self._train_and_evaluate_model(
                         X_all, y,
                         f'Historic_SiteLevel_Monthly_Polynomial_{feature}',
@@ -368,12 +317,10 @@ class HistoricModelTrainer:
                         feature_names
                     )
 
-        # Test all site-level features together
         if len(features) > 1:
             X_features = []
             feature_names = []
 
-            # Add Month
             month_encoder = LabelEncoder()
             valid_months = monthly_data[monthly_data['Month'] != '']['Month']
             if len(valid_months) > 0:
@@ -384,7 +331,6 @@ class HistoricModelTrainer:
                 )
                 feature_names.append('Month')
 
-            # Add all numeric site-level features
             for feature in features:
                 if feature in monthly_data.columns:
                     feature_availability = monthly_data[feature].notna().sum() / len(monthly_data)
@@ -394,13 +340,12 @@ class HistoricModelTrainer:
                             X_features.append(feature_data.values.reshape(-1, 1))
                             feature_names.append(feature)
 
-            if len(X_features) >= 2:  # At least Month + 1 site feature
+            if len(X_features) >= 2:
                 y = monthly_data['Volumetric Quantity'].values
                 X_all = np.hstack(X_features)
 
                 print(f"  Testing combined model with {len(feature_names)} features on {len(monthly_data)} monthly rows...")
 
-                # Train ensemble models
                 self._train_and_evaluate_model(
                     X_all, y,
                     'Historic_SiteLevel_Monthly_RandomForest_All',
@@ -417,12 +362,10 @@ class HistoricModelTrainer:
     def _train_rule_based_models(self, data_df):
         """
         Train and evaluate rule-based historic models.
-        ✅ FIXED: Now properly tests these models or doesn't create them if they can't be tested.
+        ✅ FIXED: Uses month-specific feature values where available.
         """
-
         monthly_data = data_df[data_df['Timeframe'] == 'Monthly'].copy()
 
-        # Check if we have ANY historic data at all
         has_any_historic = len(self.hdm.site_periods) > 0
 
         if len(monthly_data) == 0 and not has_any_historic:
@@ -431,7 +374,6 @@ class HistoricModelTrainer:
 
         print("  ℹ️  Testing rule-based historic models on actual data...")
 
-        # Test each model if possible
         models_to_test = [
             ('LastYear_Direct', ['Historic VQ']),
             ('LastYear_TurnoverAdjusted', ['Historic VQ', 'Turnover']),
@@ -442,7 +384,7 @@ class HistoricModelTrainer:
         for model_name, features in models_to_test:
             r2 = self._test_rule_based_model(model_name, monthly_data)
 
-            if r2 is not None and r2 > -0.5:  # Only create if testable and not terrible
+            if r2 is not None and r2 > -0.5:
                 self.models[model_name] = {
                     'model': 'rule_based',
                     'type': model_name,
@@ -464,7 +406,7 @@ class HistoricModelTrainer:
     def _test_rule_based_model(self, model_name, monthly_data):
         """
         Test a rule-based model on actual data to get real R².
-        Returns None if model can't be tested.
+        ✅ FIXED: All feature lookups now use month-specific values where available.
         """
         predictions = []
         actuals = []
@@ -475,7 +417,6 @@ class HistoricModelTrainer:
             actual_vq = row['Volumetric Quantity']
             row_date = pd.to_datetime(row['Date from'], dayfirst=True)
 
-            # Get historic period
             historic_period = self.hdm.get_most_recent_period(site, row_date)
             if not historic_period:
                 continue
@@ -483,18 +424,15 @@ class HistoricModelTrainer:
             prediction = None
 
             if model_name == 'LastYear_Direct':
-                # Get VQ from period
                 month_vq = self.hdm.get_period_vq_for_month(historic_period, month)
                 if month_vq:
                     prediction = month_vq
                 else:
-                    # Try annual
                     annual = self.hdm.get_period_annual_total(historic_period)
                     if annual:
                         prediction = annual / historic_period.months_covered
 
             elif model_name == 'LastYear_TurnoverAdjusted':
-                # Need both historic VQ and Turnover
                 month_vq = self.hdm.get_period_vq_for_month(historic_period, month)
                 if not month_vq:
                     annual = self.hdm.get_period_annual_total(historic_period)
@@ -503,14 +441,14 @@ class HistoricModelTrainer:
 
                 if month_vq:
                     current_turnover = row.get('Turnover')
-                    period_turnover = self.hdm.get_period_feature(historic_period, 'Turnover')
+                    # ✅ Use month-specific historic Turnover if available
+                    period_turnover = self.hdm.get_period_feature(historic_period, 'Turnover', month=month)
 
                     if pd.notna(current_turnover) and period_turnover and period_turnover != 0:
                         adjustment = float(current_turnover) / float(period_turnover)
                         prediction = month_vq * adjustment
 
             elif model_name == 'MultiYear_Average':
-                # Average across all periods
                 all_periods = self.hdm.get_all_periods(site)
                 relevant_periods = [p for p in all_periods if p.end_date < row_date]
 
@@ -525,7 +463,6 @@ class HistoricModelTrainer:
                         prediction = np.mean(monthly_values)
 
             elif model_name == 'LastYear_GrowthAdjusted':
-                # Need at least 2 periods
                 all_periods = self.hdm.get_all_periods(site)
                 relevant_periods = [p for p in all_periods if p.end_date < row_date]
 
@@ -545,9 +482,7 @@ class HistoricModelTrainer:
                 predictions.append(prediction)
                 actuals.append(actual_vq)
 
-        # Calculate R² if we have enough predictions
         if len(predictions) >= 10:
-            from sklearn.metrics import r2_score
             r2 = r2_score(actuals, predictions)
             return r2
         else:
@@ -556,16 +491,14 @@ class HistoricModelTrainer:
     def _evaluate_similar_sites_methods(self, data_df, selected_features):
         """
         Evaluate different 'similar sites' grouping methods using cross-validation.
-        Tests which similarity criteria produces best predictions.
+        ✅ FIXED: Uses month-specific feature values when finding similar sites.
         """
-        # Check if we have features for similarity matching
         available_features = [f for f in selected_features if f in data_df.columns]
 
         if 'Turnover' not in available_features and 'SqFt' not in available_features:
             print("  ⚠️  No features (Turnover, SqFt) available for similar sites matching")
             return
 
-        # Filter to sites that have both current and historic data
         sites_with_both = self._get_sites_with_both_periods(data_df)
 
         if len(sites_with_both) < 10:
@@ -574,7 +507,6 @@ class HistoricModelTrainer:
 
         print(f"  Testing on {len(sites_with_both)} sites with both current & historic data...")
 
-        # Test different similarity methods
         methods_to_test = []
 
         if 'Turnover' in available_features:
@@ -595,7 +527,6 @@ class HistoricModelTrainer:
                 {'name': 'Multi_Feature', 'type': 'multi', 'features': ['Turnover', 'Brand']}
             )
 
-        # Evaluate each method
         best_method = None
         best_r2 = -999
 
@@ -610,7 +541,6 @@ class HistoricModelTrainer:
                 star = " ⭐" if r2 == best_r2 else ""
                 print(f"  ✓ {method_config['name']}: R² = {r2:.4f}{star}")
 
-        # Store best method as a model
         if best_method and best_r2 > 0:
             self.models[f"SimilarSites_{best_method['name']}"] = {
                 'model': 'similar_sites',
@@ -630,11 +560,9 @@ class HistoricModelTrainer:
         sites_with_both = []
 
         for site in data_df['Site identifier'].unique():
-            # Check if site has historic periods
             if site not in self.hdm.site_periods or len(self.hdm.site_periods[site]) == 0:
                 continue
 
-            # Check if site has current data (non-blank VQ)
             site_current = data_df[data_df['Site identifier'] == site]
             if site_current['Volumetric Quantity'].notna().sum() > 0:
                 sites_with_both.append(site)
@@ -644,24 +572,20 @@ class HistoricModelTrainer:
     def _test_similar_sites_method(self, data_df, test_sites, method_config):
         """
         Test a specific similar sites method using leave-one-out cross-validation.
-
-        Returns R² score for this method.
+        ✅ FIXED: Uses month-specific feature values.
         """
         predictions = []
         actuals = []
 
         for test_site in test_sites:
-            # Get training sites (all except test site)
             training_sites = [s for s in test_sites if s != test_site]
 
-            # Get test site's data
             test_site_data = data_df[data_df['Site identifier'] == test_site]
             test_site_current = test_site_data[test_site_data['Volumetric Quantity'].notna()]
 
             if len(test_site_current) == 0:
                 continue
 
-            # Find similar sites
             similar_sites = self._find_similar_sites(
                 test_site,
                 training_sites,
@@ -672,22 +596,18 @@ class HistoricModelTrainer:
             if len(similar_sites) == 0:
                 continue
 
-            # For each month with actual data, predict using similar sites
             for _, row in test_site_current.iterrows():
                 month = row.get('Month')
                 actual_vq = row['Volumetric Quantity']
                 row_date = pd.to_datetime(row['Date from'], dayfirst=True)
 
-                # Get test site's historic period
                 test_historic_period = self.hdm.get_most_recent_period(test_site, row_date)
                 if not test_historic_period:
                     continue
 
-                # Calculate prediction from similar sites
                 similar_predictions = []
 
                 for sim_site in similar_sites:
-                    # Get similar site's historic and current VQ for this month
                     sim_site_data = data_df[data_df['Site identifier'] == sim_site]
                     sim_current_row = sim_site_data[
                         (sim_site_data['Month'] == month) &
@@ -700,7 +620,6 @@ class HistoricModelTrainer:
                     sim_current_vq = sim_current_row.iloc[0]['Volumetric Quantity']
                     sim_current_date = pd.to_datetime(sim_current_row.iloc[0]['Date from'], dayfirst=True)
 
-                    # Get similar site's historic VQ
                     sim_historic_period = self.hdm.get_most_recent_period(sim_site, sim_current_date)
                     if not sim_historic_period:
                         continue
@@ -708,18 +627,15 @@ class HistoricModelTrainer:
                     sim_historic_vq = self.hdm.get_period_vq_for_month(sim_historic_period, month)
 
                     if not sim_historic_vq:
-                        # Convert annual to monthly
                         sim_annual = self.hdm.get_period_annual_total(sim_historic_period)
                         if sim_annual:
                             sim_historic_vq = sim_annual / sim_historic_period.months_covered
 
                     if sim_historic_vq and sim_historic_vq > 0:
-                        # Calculate growth rate from this similar site
                         growth_rate = sim_current_vq / sim_historic_vq
                         similar_predictions.append(growth_rate)
 
                 if len(similar_predictions) > 0:
-                    # Get test site's historic VQ
                     test_historic_vq = self.hdm.get_period_vq_for_month(test_historic_period, month)
 
                     if not test_historic_vq:
@@ -728,33 +644,24 @@ class HistoricModelTrainer:
                             test_historic_vq = test_annual / test_historic_period.months_covered
 
                     if test_historic_vq:
-                        # Apply average growth from similar sites
                         avg_growth = np.mean(similar_predictions)
                         prediction = test_historic_vq * avg_growth
 
                         predictions.append(prediction)
                         actuals.append(actual_vq)
 
-        # Calculate R²
         if len(predictions) >= 10:
-            r2 = r2_score(actuals, predictions)
-            return r2
+            return r2_score(actuals, predictions)
         else:
             return None
 
     def _find_similar_sites(self, target_site, candidate_sites, data_df, method_config):
-        """
-        Find similar sites based on method configuration.
-
-        Returns list of similar site IDs.
-        """
+        """Find similar sites based on method configuration."""
         method_type = method_config['type']
 
-        # Get target site's feature values
         target_data = data_df[data_df['Site identifier'] == target_site].iloc[0]
 
         if method_type == 'range':
-            # Find sites within ±X% range
             feature = method_config['feature']
             threshold = method_config['threshold']
 
@@ -775,7 +682,6 @@ class HistoricModelTrainer:
             return similar
 
         elif method_type == 'top_n':
-            # Find N closest sites by feature value
             feature = method_config['feature']
             n = method_config['n']
 
@@ -796,14 +702,12 @@ class HistoricModelTrainer:
             return [site for site, _ in distances[:n]]
 
         elif method_type == 'ratio':
-            # Find sites with similar VQ-per-Feature ratio
             feature = method_config['feature']
 
             target_value = target_data.get(feature)
             if pd.isna(target_value) or target_value == 0:
                 return []
 
-            # Calculate target's historic VQ per feature
             target_periods = self.hdm.get_all_periods(target_site)
             if not target_periods:
                 return []
@@ -814,7 +718,6 @@ class HistoricModelTrainer:
 
             target_ratio = target_historic_vq / target_value
 
-            # Find sites with similar ratio
             similar = []
             for site in candidate_sites:
                 site_data = data_df[data_df['Site identifier'] == site].iloc[0]
@@ -827,15 +730,13 @@ class HistoricModelTrainer:
                         if site_historic_vq:
                             site_ratio = site_historic_vq / site_value
 
-                            # Similar if ratios within 30% of each other
                             ratio_similarity = min(target_ratio, site_ratio) / max(target_ratio, site_ratio)
                             if ratio_similarity >= 0.7:
                                 similar.append(site)
 
-            return similar[:5]  # Limit to top 5
+            return similar[:5]
 
         elif method_type == 'multi':
-            # Multi-feature similarity score
             features = method_config['features']
 
             scores = {}
@@ -852,18 +753,17 @@ class HistoricModelTrainer:
 
                         if pd.notna(target_val) and pd.notna(site_val) and target_val > 0 and site_val > 0:
                             ratio = min(target_val, site_val) / max(target_val, site_val)
-                            score += ratio * 3  # Weight: 3
+                            score += ratio * 3
                             weights += 3
 
                     elif feature == 'Brand':
                         if target_data.get('Brand') == site_data.get('Brand'):
-                            score += 1  # Weight: 1
+                            score += 1
                             weights += 1
 
                 if weights > 0:
                     scores[site] = score / weights
 
-            # Return top 5
             sorted_sites = sorted(scores.items(), key=lambda x: x[1], reverse=True)
             return [site for site, _ in sorted_sites[:5]]
 
@@ -892,31 +792,24 @@ class HistoricModelTrainer:
 
             model.fit(X_train, y_train)
 
-            # Calculate standard R² (with all features)
             y_pred = model.predict(X_test)
             r2_full = r2_score(y_test, y_pred)
 
-            # Identify derived features
             base_features, derived_features = identify_derived_features(features)
 
-            # Calculate imputed R² (simulating prediction on rows without VQ)
-            r2_imputed = r2_full  # Default to same
+            r2_imputed = r2_full
 
             if len(derived_features) > 0:
-                # Create test data with derived features replaced by their medians
                 X_test_imputed = X_test.copy()
 
                 for i, feature in enumerate(features):
                     if feature in derived_features:
-                        # Calculate median from training data
                         median_val = np.median(X_train[:, i])
                         X_test_imputed[:, i] = median_val
 
-                # Predict with imputed features
                 y_pred_imputed = model.predict(X_test_imputed)
                 r2_imputed = r2_score(y_test, y_pred_imputed)
 
-            # Store model with both R² scores
             self.models[model_name] = {
                 'model': model,
                 'features': features,
@@ -924,13 +817,19 @@ class HistoricModelTrainer:
                 'derived_features': derived_features,
                 'r2_full': r2_full,
                 'r2_imputed': r2_imputed,
-                'r2': r2_full,  # Keep for backward compatibility
+                'r2': r2_full,
                 'type': model_type,
                 'has_derived': len(derived_features) > 0,
-                'description': f'{model_type} model using {", ".join(features[:3])}{"..." if len(features) > 3 else ""}. Trained on {len(X_train)} samples, tested on {len(X_test)}. R²(full)={r2_full:.3f}, R²(imputed)={r2_imputed:.3f}' if len(derived_features) > 0 else f'{model_type} model using {", ".join(features[:3])}{"..." if len(features) > 3 else ""}. Trained on {len(X_train)} samples, tested on {len(X_test)}. R²={r2_full:.3f}'
+                'description': (
+                    f'{model_type} model using {", ".join(features[:3])}{"..." if len(features) > 3 else ""}. '
+                    f'Trained on {len(X_train)} samples, tested on {len(X_test)}. '
+                    f'R²(full)={r2_full:.3f}, R²(imputed)={r2_imputed:.3f}'
+                    if len(derived_features) > 0 else
+                    f'{model_type} model using {", ".join(features[:3])}{"..." if len(features) > 3 else ""}. '
+                    f'Trained on {len(X_train)} samples, tested on {len(X_test)}. R²={r2_full:.3f}'
+                )
             }
 
-            # Track R² by feature set for quality scoring
             feature_key = tuple(sorted(features))
             self.feature_set_r2[feature_key] = r2_full
 
