@@ -1,2365 +1,1602 @@
 """
-Volumetric Data Extrapolation Tool with Historic Data Support
-Fills in missing volumetric quantities using regression models, seasonal patterns, and historic data
+Volumetric Data Extrapolation Tool
+====================================
+Clean rewrite — simple, honest, effective.
 
-✅ UPDATED: Month-aware feature access
-- apply_historic_model() uses month-specific Turnover for LastYear_TurnoverAdjusted
-- _create_monthly_comparison_rows() has fallback chain for historic feature lookup
-- Covers all input file formats (annual, monthly, mixed features)
+Pipeline:
+  1. Load & normalise data (flexible date formats, site ID / Location fallback)
+  2. Detect features (numeric + categorical) and timeframe (Monthly / Annual)
+  3. Statistical tests: Pearson, Spearman, Kendall, Point-biserial on every
+     relevant data combination — features labelled exactly as in input file
+  4. Rule-based methods: site average, site-seasonal, feature intensity,
+     annual-feature x seasonal, historic-adjusted (if historic data present)
+  5. ML models: Linear, Polynomial, Random Forest, Gradient Boosting
+  6. Per-row selection: highest effective R2 wins
+  7. Output: Complete Records, Data Availability, Statistical Analysis,
+     Machine Learning Models (with train/test row detail), YoY Analysis
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from sklearn.model_selection import train_test_split
+from scipy import stats
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import LabelEncoder, PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, LabelEncoder
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.metrics import r2_score
 from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import cross_val_score, KFold, LeaveOneOut
 from collections import defaultdict
 import warnings
-
 warnings.filterwarnings('ignore')
 
-VERSION = "2.0_features_key_intensity_models"  # Check this to verify you're running the updated file
+MONTHS_ORDER = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+]
 
-import sys
-
-if 'historic_data_module' in sys.modules:
-    del sys.modules['historic_data_module']
-if 'feature_engineering_module' in sys.modules:
-    del sys.modules['feature_engineering_module']
-if 'historic_model_training' in sys.modules:
-    del sys.modules['historic_model_training']
-if 'scenario_based_selection' in sys.modules:
-    del sys.modules['scenario_based_selection']
-
-from historic_data_handler import HistoricDataManager
-from historic_feature_engineering import HistoricFeatureEngineer
-from historic_model_training import HistoricModelTrainer
-from scenario_based_selection import ScenarioBasedModelSelector
-
-CORE_COLUMNS = {
-    'Client', 'Site identifier', 'Location', 'Date from', 'Date to',
-    'GHG Category', 'Volumetric Quantity', 'Timeframe', 'Month',
-    'Data Timeframe', 'Data integrity', 'Estimation Method',
-    'Data Quality', 'Data Quality Score', 'Year', 'Years_Since_Baseline'
+_META = {
+    'Row ID', 'Current Timestamp', 'Client Name', 'Client', 'Country',
+    'Site identifier', 'Site_identifier', 'site identifier', 'site_id',
+    'Location', 'location', 'Site Name', 'site_name',
+    'Date from', 'Date to', 'Date_from', 'Date_to',
+    'Data Timeframe', 'Timeframe', 'timeframe',
+    'GHG Category', 'GHG Sub Category',
+    'Volumetric Quantity', 'Volumetric_Quantity',
+    'Data integrity', 'Estimation Method', 'Data Quality Score',
+    'Month', 'Year', 'Financial Year', 'FY',
+    'Scope', 'Functional Unit', 'Calculation Method',
+    'Emission source', 'Meter Number',
+    '_Timeframe', '_Month',
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Date helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_effective_r2_for_row(model_info, row):
+def _parse_date(val):
+    if val is None:
+        return None
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return pd.Timestamp(val)
+    if isinstance(val, float) and np.isnan(val):
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(val))
+        except Exception:
+            return None
+    if isinstance(val, str):
+        for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y', '%d-%m-%Y',
+                    '%d/%m/%y', '%Y/%m/%d', '%d %b %Y', '%d %B %Y'):
+            try:
+                return pd.Timestamp(datetime.strptime(val.strip(), fmt))
+            except Exception:
+                pass
+        try:
+            return pd.to_datetime(val, dayfirst=True)
+        except Exception:
+            return None
+    return None
+
+
+def _timeframe(date_from, date_to):
+    if date_from is None or date_to is None:
+        return 'Unknown', None
+    if date_from.day == 1:
+        next_mo = date_from + relativedelta(months=1)
+        last_day = next_mo - pd.Timedelta(days=1)
+        if date_to.date() == last_day.date():
+            return 'Monthly', date_from.strftime('%B')
+    days = (date_to - date_from).days + 1
+    if 365 <= days <= 366:
+        return 'Annual', None
+    return f'{days}d', None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature scanning — used by GUI to populate feature selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
     """
-    Determine which R² to use based on row's feature availability.
-    If row is missing any derived features → use r2_imputed
-    If row has all features → use r2_full
+    Scan a file and return feature candidates with quality scores.
+    Returns list of dicts:
+      { name, type, fill_pct, unique_count, variance_score, recommended, reason }
     """
-    if model_info.get('type') in ['LastYear_Direct', 'LastYear_TurnoverAdjusted',
-                                  'MultiYear_Average', 'LastYear_GrowthAdjusted',
-                                  'Site_Seasonal', 'Annual_Average']:
-        return model_info.get('r2', 0)
+    if filepath.lower().endswith('.csv'):
+        df = pd.read_csv(filepath, nrows=5000)
+    else:
+        df = pd.read_excel(filepath, nrows=5000)
+    df.columns = df.columns.str.strip()
 
-    if not model_info.get('has_derived', False):
-        return model_info.get('r2_full', model_info.get('r2', 0))
+    # Find site and VQ cols to exclude
+    skip = set(_META)
+    for cand in ['Site identifier', 'Site_identifier', 'Location', 'location',
+                 'Volumetric Quantity', 'Volumetric_Quantity', vq_col_hint]:
+        skip.add(cand)
 
-    derived_features = model_info.get('derived_features', [])
+    results = []
+    n = len(df)
 
-    for feature in derived_features:
-        if feature not in row.index or pd.isna(row[feature]):
-            return model_info.get('r2_imputed', model_info.get('r2', 0))
+    for col in df.columns:
+        if col in skip or col.startswith('_'):
+            continue
 
-    return model_info.get('r2_full', model_info.get('r2', 0))
+        non_null = df[col].dropna()
+        fill_pct = round(len(non_null) / n * 100, 1) if n > 0 else 0
+        if fill_pct < 10 or len(non_null) < 4:
+            continue  # too sparse to be useful
+
+        unique_count = non_null.nunique()
+
+        is_numeric = pd.api.types.is_numeric_dtype(df[col])
+        if not is_numeric:
+            # Try coercing — strip commas and currency symbols first
+            cleaned = non_null.astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip()
+            conv = pd.to_numeric(cleaned, errors='coerce')
+            if conv.notna().sum() / len(non_null) > 0.8:
+                is_numeric = True
+                non_null = conv.dropna()
+                unique_count = non_null.nunique()
+
+        if is_numeric:
+            if unique_count < 2:
+                continue
+            # Coefficient of variation as variance score (capped 0–1)
+            mean_val = non_null.mean()
+            std_val  = non_null.std()
+            cv = (std_val / mean_val) if mean_val != 0 else 0
+            variance_score = round(min(float(cv), 1.0), 3)
+            feat_type = 'Numeric'
+
+            # Recommendation logic
+            if fill_pct >= 70 and variance_score >= 0.3 and unique_count >= 10:
+                recommended = True
+                reason = f'Good fill rate ({fill_pct}%), strong variance (CV={variance_score:.2f}), {unique_count} unique values'
+            elif fill_pct >= 50 and variance_score >= 0.15:
+                recommended = True
+                reason = f'Adequate fill ({fill_pct}%), moderate variance (CV={variance_score:.2f})'
+            else:
+                recommended = False
+                reason = (f'Low fill rate ({fill_pct}%)' if fill_pct < 50
+                          else f'Low variance (CV={variance_score:.2f}) — little predictive signal')
+
+        else:
+            if unique_count < 2 or unique_count > 30:
+                continue
+            # For categoricals: score by how evenly distributed values are (entropy)
+            counts = non_null.value_counts(normalize=True)
+            entropy = float(-np.sum(counts * np.log2(counts + 1e-10)))
+            max_entropy = np.log2(unique_count) if unique_count > 1 else 1
+            variance_score = round(entropy / max_entropy, 3) if max_entropy > 0 else 0
+            feat_type = 'Categorical'
+
+            if fill_pct >= 70 and unique_count >= 2 and variance_score >= 0.5:
+                recommended = True
+                reason = f'Good fill ({fill_pct}%), {unique_count} categories, well-distributed (entropy={variance_score:.2f})'
+            elif fill_pct >= 50 and unique_count >= 2:
+                recommended = True
+                reason = f'Adequate fill ({fill_pct}%), {unique_count} categories'
+            else:
+                recommended = False
+                reason = (f'Low fill rate ({fill_pct}%)' if fill_pct < 50
+                          else f'Skewed distribution — one category dominates (entropy={variance_score:.2f})')
+
+        results.append({
+            'name': col,
+            'type': feat_type,
+            'fill_pct': fill_pct,
+            'unique_count': unique_count,
+            'variance_score': variance_score,
+            'recommended': recommended,
+            'reason': reason,
+        })
+
+    # Sort: recommended first, then by variance_score desc
+    results.sort(key=lambda x: (-int(x['recommended']), -x['variance_score']))
+    return results
 
 
-class VolumetricExtrapolationTool:
+# ─────────────────────────────────────────────────────────────────────────────
+# Stat helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pearson(x, y):
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 4:
+        return None, None, None
+    try:
+        r, p = stats.pearsonr(x[m], y[m])
+        return float(r), float(r**2), float(p)
+    except Exception:
+        return None, None, None
+
+
+def _spearman(x, y):
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 4:
+        return None, None, None
+    try:
+        r, p = stats.spearmanr(x[m], y[m])
+        return float(r), float(r**2), float(p)
+    except Exception:
+        return None, None, None
+
+
+def _kendall(x, y):
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 4:
+        return None, None, None
+    try:
+        tau, p = stats.kendalltau(x[m], y[m])
+        return float(tau), float(tau**2), float(p)
+    except Exception:
+        return None, None, None
+
+
+def _pointbiserial(codes, y):
+    m = np.isfinite(codes) & np.isfinite(y)
+    if m.sum() < 4 or len(np.unique(codes[m])) < 2:
+        return None, None, None
+    try:
+        r, p = stats.pointbiserialr(codes[m], y[m])
+        return float(r), float(r**2), float(p)
+    except Exception:
+        return None, None, None
+
+
+def _eff_r2(pr2, sr2, kr2=None, pbr2=None):
+    cands = [v for v in (pr2, sr2, kr2, pbr2) if v is not None]
+    return max(cands) if cands else 0.0
+
+
+def _cv_r2_with_meta(model, X, y, cv=5):
     """
-    Tool to extrapolate missing volumetric quantities using regression models,
-    seasonal patterns, and optionally historic data.
-    """
+    Returns (mean_r2, n_train, n_test_per_fold, n_folds, cv_type).
 
-    def __init__(self, extrapolate_file, factor_database_file=None, selected_features=None,
-                 historic_records_file=None, historic_features_file=None):
-        self.extrapolate_file = extrapolate_file
-        self.factor_database_file = factor_database_file
-        self.selected_features = selected_features or []
+    Note: LeaveOneOut with n<10 returns nan for mean_r2 — R² is mathematically
+    undefined when there is only 1 test point per fold. The models still train
+    and are used for predictions; the nan simply means CV evaluation is
+    not possible at this sample size.
+    """
+    n = len(X)
+    if n < 4:
+        return float('nan'), n, 0, 0, 'insufficient'
+    if n < 10:
+        scores = cross_val_score(model, X, y, cv=LeaveOneOut(), scoring='r2')
+        mean_r2 = float(np.nanmean(scores)) if np.any(np.isfinite(scores)) else float('nan')
+        return mean_r2, n, 1, n, 'LeaveOneOut'
+    else:
+        k = min(cv, n // 2)
+        kf = KFold(n_splits=k, shuffle=True, random_state=42)
+        scores = cross_val_score(model, X, y, cv=kf, scoring='r2')
+        n_test = n // k
+        return float(np.mean(scores)), n, n_test, k, f'{k}-Fold'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main tool class
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ExtrapolationTool:
+
+    def __init__(self, input_file,
+                 historic_records_file=None,
+                 historic_features_file=None,
+                 forced_numeric_features=None,
+                 forced_categorical_features=None):
+        """
+        forced_numeric_features / forced_categorical_features:
+            If provided (lists of column names), use these instead of auto-detection.
+            Supplied by the GUI feature selector.
+        """
+        self.input_file = input_file
         self.historic_records_file = historic_records_file
         self.historic_features_file = historic_features_file
+        self.forced_numeric_features = forced_numeric_features
+        self.forced_categorical_features = forced_categorical_features
 
         self.df = None
-        self.blank_df = None
-        self.data_df = None
+        self.known = None
+        self.blank = None
 
-        self.seasonal_patterns = {}
-        self.models = {}
-        self.site_level_features = []
-        self.row_level_features = []
+        self.site_col = None
+        self.vq_col = None
+        self.ghg_col = None          # GHG Category column if present
+        self.ghg_sub_col = None      # GHG Sub Category column if present
+        self.numeric_features = []
         self.categorical_features = []
-        self.categorical_encoders = {}
+        self.seasonal_patterns = {}          # cross-dataset {month: factor}
+        self.site_seasonal_patterns = {}     # per-site {composite_key: {month: factor}}
+        self._vq_lo = 0.0
+        self._vq_hi = float('inf')
 
-        self.historic_manager = None
-        self.feature_engineer = None
-        self.historic_trainer = None
-        self.has_historic_data = False
+        self.stat_methods = {}
+        self.ml_models = {}
+        self.cat_breakdown = {}
 
-    def load_data(self):
-        """Load the extrapolate file and identify columns"""
-        if self.extrapolate_file.endswith('.csv'):
-            self.df = pd.read_csv(self.extrapolate_file)
+        self.historic_vq = {}            # {composite_key: {month_or_ANNUAL: vq}}
+        self.historic_growth_rates = {}  # {composite_key: annual_growth_rate}
+        self.historic_feats = {}         # {site: {feat: value}}  (site-level only)
+        self.historic_anchor_quality = {}
+        self.historic_year = None
+        self.current_year = None
+
+    # ── Loading ───────────────────────────────────────────────────────────────
+
+    def load(self):
+        print("=" * 60)
+        print("LOADING DATA")
+        print("=" * 60)
+        if self.input_file.lower().endswith('.csv'):
+            self.df = pd.read_csv(self.input_file)
         else:
-            self.df = pd.read_excel(self.extrapolate_file)
-
+            self.df = pd.read_excel(self.input_file)
         self.df.columns = self.df.columns.str.strip()
+        print(f"  {len(self.df)} rows x {len(self.df.columns)} columns")
 
-        print(f"Loaded {len(self.df)} rows with {len(self.df.columns)} columns")
+        self.vq_col = self._col(['Volumetric Quantity', 'Volumetric_Quantity', 'VQ'])
+        if not self.vq_col:
+            raise ValueError("Cannot find 'Volumetric Quantity' column.")
 
-        self._convert_numeric_columns()
+        self.site_col = self._col(
+            ['Site identifier', 'Site_identifier', 'Site ID', 'SiteID'])
+        if not self.site_col:
+            self.site_col = self._col(['Location', 'location', 'Site Name'])
+            if self.site_col:
+                print(f"  Using '{self.site_col}' as site key (no Site identifier found)")
+            else:
+                raise ValueError("Cannot find site identifier or location column.")
 
-        return self.df
+        self._add_timeframe_cols()
+        self._coerce_numeric()
+        self._detect_features()
 
-    def _convert_numeric_columns(self):
-        """Convert columns to numeric if they contain numeric data stored as text."""
-        always_numeric = ['Volumetric Quantity', 'Turnover', 'Transactions',
-                          'Square Footage', 'Floor Space', 'Revenue', 'Sales']
+        # Detect GHG category columns — used as part of composite key
+        self.ghg_col     = self._col(['GHG Category', 'GHG_Category', 'ghg_category'])
+        self.ghg_sub_col = self._col(['GHG Sub Category', 'GHG_Sub_Category'])
+        if self.ghg_col:
+            cats = self.df[self.ghg_col].dropna().unique()
+            print(f"  GHG categories found: {list(cats)}")
+            print(f"  Predictions will be keyed on Site + GHG Category"
+                  + (" + GHG Sub Category" if self.ghg_sub_col else ""))
 
+        self.known = self.df[self.df[self.vq_col].notna()].copy()
+        self.blank = self.df[self.df[self.vq_col].isna()].copy()
+        print(f"  Known VQ: {len(self.known)} | Missing VQ: {len(self.blank)}")
+
+        from_col = self._col(['Date from', 'Date_from'])
+        if from_col:
+            for v in self.df[from_col].dropna():
+                p = _parse_date(v)
+                if p:
+                    self.current_year = p.year
+                    break
+
+        if self.historic_records_file:
+            self._load_historic_records()
+        if self.historic_features_file:
+            self._load_historic_features()
+        return self
+
+    def _col(self, candidates):
+        low = {c.lower().strip(): c for c in self.df.columns}
+        for c in candidates:
+            if c in self.df.columns:
+                return c
+            if c.lower() in low:
+                return low[c.lower()]
+        return None
+
+    def _composite_key(self, row_or_site, ghg=None, ghg_sub=None):
+        """
+        Build a composite lookup key: (site, ghg_category [, ghg_sub_category]).
+
+        GHG Sub Category is only included in the key when it is actually populated
+        on this row. This means:
+          - Waste / Water  →  (site, 'Waste', 'Water')   ← specific match only
+          - Waste / (blank) → (site, 'Waste')             ← never matches Water rows
+        So a blank-sub prediction won't accidentally borrow from a sub-categorised
+        historic entry, and vice versa.
+
+        Accepts either a dict/Series row (then extracts cols automatically)
+        or explicit string values.
+        """
+        _BLANK = {'', 'nan', 'none', 'n/a', '-'}
+
+        if isinstance(row_or_site, (dict, pd.Series)):
+            row     = row_or_site
+            site    = str(row.get(self.site_col, '') or '').strip()
+            ghg     = str(row.get(self.ghg_col,     '') or '').strip() if self.ghg_col     else ''
+            ghg_sub = str(row.get(self.ghg_sub_col, '') or '').strip() if self.ghg_sub_col else ''
+        else:
+            site    = str(row_or_site or '').strip()
+            ghg     = str(ghg     or '').strip()
+            ghg_sub = str(ghg_sub or '').strip()
+
+        # Normalise: treat blanks, 'nan', 'None', 'N/A' as absent
+        if ghg.lower()     in _BLANK: ghg     = ''
+        if ghg_sub.lower() in _BLANK: ghg_sub = ''
+
+        if ghg and ghg_sub:
+            return (site, ghg, ghg_sub)
+        elif ghg:
+            return (site, ghg)
+        else:
+            return (site,)
+
+    def _add_timeframe_cols(self):
+        from_col = self._col(['Date from', 'Date_from'])
+        to_col   = self._col(['Date to', 'Date_to'])
+        fs = self.df[from_col] if from_col else pd.Series([None]*len(self.df))
+        ts = self.df[to_col]   if to_col   else pd.Series([None]*len(self.df))
+        tfs, mos = [], []
+        for f, t in zip(fs, ts):
+            tf, mo = _timeframe(_parse_date(f), _parse_date(t))
+            tfs.append(tf)
+            mos.append(mo or '')
+        self.df['_Timeframe'] = tfs
+        self.df['_Month'] = mos
+        print(f"  Timeframes: {pd.Series(tfs).value_counts().to_dict()}")
+
+    def _coerce_numeric(self):
+        hints = ['turnover', 'transaction', 'revenue', 'sales', 'sqft', 'floor',
+                 'space', 'electricity', 'area', 'count', 'quantity', 'volume',
+                 'consumption', 'spend', 'units', 'kw', 'kwh', 'water', 'waste',
+                 'headcount', 'staff', 'seats', 'covers', 'hours']
         for col in self.df.columns:
+            if col in _META or col.startswith('_'):
+                continue
             if pd.api.types.is_numeric_dtype(self.df[col]):
                 continue
+            non_null = self.df[col].dropna()
+            if not len(non_null):
+                continue
 
-            should_be_numeric = any(keyword.lower() in col.lower()
-                                    for keyword in always_numeric)
+            # Strip commas and currency symbols before attempting conversion
+            # e.g. "20,000" → "20000", "£1,234.56" → "1234.56"
+            cleaned = non_null.astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip()
+            conv = pd.to_numeric(cleaned, errors='coerce')
+            rate = conv.notna().sum() / len(non_null)
+            hint = any(h in col.lower() for h in hints)
 
-            if should_be_numeric or col in always_numeric:
-                try:
-                    converted = pd.to_numeric(self.df[col], errors='coerce')
-                    successful = converted.notna().sum()
-                    total = self.df[col].notna().sum()
+            # Apply if: named like a numeric feature AND mostly converts,
+            # OR: no hint needed if conversion is near-perfect (>95%) — catches
+            # any numeric column regardless of name
+            if (rate > 0.8 and hint) or rate > 0.95:
+                self.df[col] = pd.to_numeric(
+                    self.df[col].astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip(),
+                    errors='coerce'
+                )
+                if rate > 0.8 and hint:
+                    print(f"  Coerced '{col}' to numeric (comma/symbol stripped, {rate:.0%} convertible)")
 
-                    if total > 0 and successful / total > 0.8:
-                        self.df[col] = converted
-                        print(f"  ✓ Converted '{col}' to numeric ({successful}/{total} values)")
-                except:
-                    pass
+    def _detect_features(self):
+        # If the GUI has provided explicit feature lists, honour them
+        if self.forced_numeric_features is not None or self.forced_categorical_features is not None:
+            self.numeric_features     = list(self.forced_numeric_features or [])
+            self.categorical_features = list(self.forced_categorical_features or [])
+            print(f"  Numeric features (user-selected):     {self.numeric_features}")
+            print(f"  Categorical features (user-selected): {self.categorical_features}")
+            return
 
-            elif not should_be_numeric:
-                try:
-                    non_null = self.df[col].dropna()
-                    if len(non_null) > 0:
-                        converted = pd.to_numeric(non_null, errors='coerce')
-                        successful = converted.notna().sum()
-                        conversion_rate = successful / len(non_null)
-                        unique_ratio = non_null.nunique() / len(non_null)
-
-                        if conversion_rate > 0.8 and unique_ratio > 0.1:
-                            self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-                            print(f"  ✓ Auto-detected numeric column '{col}' (was text format)")
-                except:
-                    pass
-
-    def parse_dates(self, date_str):
-        """Parse date string handling both standard format and Excel serial dates"""
-        try:
-            if isinstance(date_str, (int, float)):
-                excel_epoch = datetime(1899, 12, 30)
-                return excel_epoch + pd.Timedelta(days=date_str)
-            return pd.to_datetime(date_str, format='%d/%m/%Y')
-        except:
-            return pd.to_datetime(date_str, dayfirst=True)
-
-    def determine_timeframe(self, row):
-        """Determine if data is Monthly, Annual, or custom days"""
-        date_from = self.parse_dates(row['Date from'])
-        date_to = self.parse_dates(row['Date to'])
-
-        if date_from.day == 1:
-            next_month = date_from + relativedelta(months=1)
-            last_day = next_month - pd.Timedelta(days=1)
-
-            if date_to.date() == last_day.date():
-                return 'Monthly', date_from.strftime('%B')
-
-        days_diff = (date_to - date_from).days + 1
-        if days_diff >= 365 and days_diff <= 366:
-            return 'Annual', None
-
-        return f'{days_diff} days', None
-
-    def add_timeframe_columns(self):
-        """Add Timeframe and Month columns to dataframe"""
-        timeframes = []
-        months = []
-
-        for idx, row in self.df.iterrows():
-            timeframe, month = self.determine_timeframe(row)
-            timeframes.append(timeframe)
-            months.append(month if month else '')
-
-        self.df['Timeframe'] = timeframes
-        self.df['Month'] = months
-        print(f"Detected timeframes: {self.df['Timeframe'].value_counts().to_dict()}")
-
-    def load_historic_data(self):
-        """Load and process historic data if provided"""
-        if not self.historic_records_file:
-            print("\nℹ️  No historic data provided - using standard models only")
-            return False
-
-        print("\n" + "=" * 70)
-        print("LOADING HISTORIC DATA")
-        print("=" * 70)
-
-        try:
-            self.historic_manager = HistoricDataManager()
-            self.historic_manager.detect_current_period(self.df)
-
-            ghg_categories = self.df['GHG Category'].unique().tolist()
-
-            self.historic_manager.load_historic_records(
-                self.historic_records_file,
-                ghg_categories
-            )
-
-            if self.historic_features_file:
-                self.historic_manager.load_historic_features(self.historic_features_file)
-
-            current_sites = self.df['Site identifier'].unique().tolist()
-            self.historic_manager.create_availability_matrix(self.df)
-            self.historic_manager.identify_new_sites(current_sites)
-
-            total_periods = sum(len(periods) for periods in self.historic_manager.site_periods.values())
-            historic_years = self.historic_manager.historic_years if hasattr(self.historic_manager,
-                                                                             'historic_years') else []
-
-            print("\n" + "=" * 70)
-            print("HISTORIC DATA VALIDATION")
-            print("=" * 70)
-
-            if total_periods == 0:
-                print("⚠️  WARNING: Historic data loaded but NO HISTORIC PERIODS detected!")
-                print("\n❌ HISTORIC MODELS DISABLED - Using standard models only")
-                print("=" * 70)
-                self.has_historic_data = False
-                return False
-
-            if len(historic_years) == 0:
-                print("⚠️  WARNING: Historic periods found but NO HISTORIC YEARS detected!")
-                print("\n❌ HISTORIC MODELS DISABLED - Using standard models only")
-                print("=" * 70)
-                self.has_historic_data = False
-                return False
-
-            print(f"✅ VALIDATION PASSED:")
-            print(f"    • {total_periods} historic periods across {len(self.historic_manager.site_periods)} sites")
-            print(f"    • {len(historic_years)} historic years detected: {sorted(historic_years)}")
-            print(f"    • Historic models ENABLED")
-            print("=" * 70)
-
-            self.has_historic_data = True
-            return True
-
-        except Exception as e:
-            print(f"\n⚠️  Error loading historic data: {e}")
-            import traceback
-            traceback.print_exc()
-            print("  Continuing with standard models only...")
-            self.has_historic_data = False
-            return False
-
-    def engineer_historic_features(self):
-        """Create features from historic data"""
-        if not self.has_historic_data:
-            return self.df
-
-        try:
-            self.feature_engineer = HistoricFeatureEngineer(self.historic_manager)
-            self.df = self.feature_engineer.engineer_all_features(self.df)
-
-            recommended = self.feature_engineer.recommend_features_for_ml(self.df)
-
-            for feat in recommended:
-                if feat not in self.selected_features:
-                    self.selected_features.append(feat)
-
-            return self.df
-
-        except Exception as e:
-            print(f"\n⚠️  Error engineering features: {e}")
-            return self.df
-
-    def identify_blank_rows(self):
-        """Separate rows with blank volumetric quantities from those with data"""
-        self.blank_df = self.df[self.df['Volumetric Quantity'].isna()].copy()
-        self.data_df = self.df[self.df['Volumetric Quantity'].notna()].copy()
-
-        print(f"\nFound {len(self.blank_df)} rows with missing volumetric quantities")
-        print(f"Found {len(self.data_df)} rows with data")
-
-    def detect_available_features(self):
-        """Detect all non-core columns that could be used as features"""
-        available_features = []
-
-        for col in self.df.columns:
-            if col not in CORE_COLUMNS:
-                non_null_count = self.df[col].notna().sum()
-                if non_null_count > 0:
-                    available_features.append(col)
-
-        return available_features
-
-    def classify_features(self):
-        """Classify features as site-level (constant per site) or row-level (varies)"""
-        print("\n" + "=" * 60)
-        print("FEATURE CLASSIFICATION")
-        print("=" * 60)
-
-        self.site_level_features = []
-        self.row_level_features = []
+        skip = _META | {self.site_col, self.vq_col}
+        self.numeric_features = []
         self.categorical_features = []
-
-        if 'Timeframe' in self.df.columns:
-            self.categorical_features.append('Timeframe')
-
-        # If no features were explicitly selected, auto-detect from available columns
-        if not self.selected_features:
-            self.selected_features = self.detect_available_features()
-            if self.selected_features:
-                print(f"  ℹ️  No features selected — auto-detected: {self.selected_features}")
-
-        for feature in self.selected_features:
-            if feature not in self.df.columns:
+        for col in self.df.columns:
+            if col in skip or col.startswith('_'):
                 continue
-
-            is_site_level = True
-            sites = self.df['Site identifier'].unique()
-
-            for site in sites:
-                site_data = self.df[self.df['Site identifier'] == site][feature]
-                site_data_clean = site_data.dropna()
-
-                if len(site_data_clean) > 1:
-                    if pd.api.types.is_numeric_dtype(site_data_clean):
-                        if site_data_clean.nunique() > 1:
-                            is_site_level = False
-                            break
-                    else:
-                        if len(set(site_data_clean)) > 1:
-                            is_site_level = False
-                            break
-
-            if is_site_level:
-                self.site_level_features.append(feature)
-                print(f"✓ {feature}: Site-level (constant per site)")
-            else:
-                self.row_level_features.append(feature)
-                print(f"✓ {feature}: Row-level (varies by month)")
-
-            if not pd.api.types.is_numeric_dtype(self.df[feature]):
-                if feature not in self.categorical_features:
-                    self.categorical_features.append(feature)
-
-        print(f"\nSite-level features: {len(self.site_level_features)}")
-        print(f"Row-level features: {len(self.row_level_features)}")
-        print(f"Categorical features: {len(self.categorical_features)}")
-
-    def calculate_seasonal_patterns(self):
-        """Calculate average seasonal patterns by month"""
-        monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-
-        if len(monthly_data) == 0:
-            print("\nNo monthly data for seasonal pattern calculation")
-            return
-
-        print("\n" + "=" * 60)
-        print("SEASONAL PATTERN ANALYSIS")
-        print("=" * 60)
-
-        month_avgs = monthly_data.groupby('Month')['Volumetric Quantity'].mean()
-        overall_avg = month_avgs.mean()
-
-        self.seasonal_patterns['Overall'] = {}
-        for month in month_avgs.index:
-            self.seasonal_patterns['Overall'][month] = month_avgs[month] / overall_avg
-
-        print("\nOverall seasonal pattern:")
-        months_order = ['January', 'February', 'March', 'April', 'May', 'June',
-                        'July', 'August', 'September', 'October', 'November', 'December']
-        for month, factor in sorted(self.seasonal_patterns['Overall'].items(),
-                                    key=lambda x: months_order.index(x[0]) if x[0] in months_order else 99):
-            print(f"  {month}: {factor:.2%}")
-
-        if 'Brand' in self.df.columns:
-            brands = monthly_data['Brand'].dropna().unique()
-            if len(brands) > 1:
-                print(f"\nDetected {len(brands)} brands - calculating brand-specific patterns...")
-                for brand in brands:
-                    brand_data = monthly_data[monthly_data['Brand'] == brand]
-                    if len(brand_data) >= 6:
-                        brand_month_avgs = brand_data.groupby('Month')['Volumetric Quantity'].mean()
-                        brand_overall_avg = brand_month_avgs.mean()
-
-                        self.seasonal_patterns[brand] = {}
-                        for month in brand_month_avgs.index:
-                            self.seasonal_patterns[brand][month] = brand_month_avgs[month] / brand_overall_avg
-                        print(f"  ✓ {brand}: {len(brand_month_avgs)} months of data")
-
-        self._handle_missing_seasonal_months()
-
-    def _handle_missing_seasonal_months(self):
-        """Detect and handle months with no data in current year."""
-        all_months = ['January', 'February', 'March', 'April', 'May', 'June',
-                      'July', 'August', 'September', 'October', 'November', 'December']
-
-        if 'Overall' not in self.seasonal_patterns or len(self.seasonal_patterns['Overall']) == 0:
-            print("\n⚠️  WARNING: No seasonal patterns calculated - insufficient monthly data")
-            return
-
-        current_months = set(self.seasonal_patterns['Overall'].keys())
-        missing_months = [m for m in all_months if m not in current_months]
-
-        if len(missing_months) == 0:
-            return
-
-        print(f"\n⚠️  MISSING SEASONAL DATA DETECTED")
-        print(f"   Missing months: {', '.join(missing_months)}")
-
-        for missing_month in missing_months:
-            pattern = self._calculate_missing_month_pattern(missing_month, all_months)
-
-            if pattern:
-                self.seasonal_patterns['Overall'][missing_month] = pattern['factor']
-                print(f"   ✓ {missing_month}: {pattern['factor']:.2%} ({pattern['source']})")
-
-                if not hasattr(self, 'seasonal_warnings'):
-                    self.seasonal_warnings = {}
-                self.seasonal_warnings[missing_month] = pattern['source']
-
-    def _calculate_missing_month_pattern(self, missing_month, all_months):
-        """Calculate seasonal pattern for a missing month."""
-        if self.has_historic_data and self.historic_manager:
-            historic_pattern = self._get_historic_seasonal_pattern(missing_month)
-            if historic_pattern:
-                return {'factor': historic_pattern, 'source': 'historic data'}
-
-        month_index = all_months.index(missing_month)
-        prev_month = all_months[(month_index - 1) % 12]
-        next_month = all_months[(month_index + 1) % 12]
-
-        prev_pattern = self.seasonal_patterns['Overall'].get(prev_month)
-        next_pattern = self.seasonal_patterns['Overall'].get(next_month)
-
-        if prev_pattern and next_pattern:
-            interpolated = (prev_pattern + next_pattern) / 2
-            return {'factor': interpolated, 'source': f'interpolated from {prev_month} & {next_month}'}
-
-        return {'factor': 1.0, 'source': 'equal distribution (no data available)'}
-
-    def _get_historic_seasonal_pattern(self, month):
-        """Calculate seasonal pattern from historic data for a specific month."""
-        month_vqs = []
-        all_vqs = []
-
-        for site, periods in self.historic_manager.site_periods.items():
-            for period in periods:
-                month_vq = self.historic_manager.get_period_vq_for_month(period, month)
-                if month_vq:
-                    month_vqs.append(month_vq)
-
-                if period.monthly_data:
-                    all_vqs.extend(period.monthly_data.values())
-                elif period.annual_total:
-                    monthly_avg = period.annual_total / period.months_covered
-                    all_vqs.extend([monthly_avg] * period.months_covered)
-
-        if len(month_vqs) >= 3 and len(all_vqs) >= 12:
-            month_avg = np.mean(month_vqs)
-            overall_avg = np.mean(all_vqs)
-
-            if overall_avg > 0:
-                return month_avg / overall_avg
-
-        return None
-
-    def train_models(self):
-        """Train various regression models on available data"""
-        print("\n" + "=" * 60)
-        print("MODEL TRAINING")
-        print("=" * 60)
-
-        if len(self.data_df) < 3:
-            print("Insufficient data for model training (need at least 3 rows)")
-            return
-
-        if self.has_historic_data and self.historic_manager and self.feature_engineer:
-            self.historic_trainer = HistoricModelTrainer(
-                self.historic_manager,
-                self.feature_engineer
-            )
-            historic_models = self.historic_trainer.train_all_models(
-                self.df,
-                self.data_df,
-                self.selected_features
-            )
-            self.models.update(historic_models)
-
-        print("\n🎯 TIER 3: Standard Models (No Historic Data Required)")
-
-        if len(self.row_level_features) > 0:
-            monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-            if len(monthly_data) >= 10:
-                print("\n📊 Training models for MONTHLY data with row-level features...")
-                self.train_monthly_models(monthly_data)
-
-        if len(self.site_level_features) > 0:
-            print("\n📊 Training models for SITE-LEVEL features...")
-            self.train_site_level_models()
-
-        self.train_site_seasonal_model()
-        self.create_seasonal_variants()
-        self.train_annual_average_model()
-
-        # Always train intensity models -- these are the baseline humans use manually
-        # Runs for ANY data format (annual or monthly), with or without seasonality
-        all_numeric_features = [
-            f for f in (self.site_level_features + self.row_level_features)
-            if f in self.data_df.columns and pd.api.types.is_numeric_dtype(self.data_df[f])
-        ]
-        if all_numeric_features:
-            print("\n📊 Training intensity models (VQ ~ Feature, always visible)...")
-            self.train_intensity_models(all_numeric_features)
-
-        print(f"\n✓ Trained {len(self.models)} models total")
-
-    def train_monthly_models(self, monthly_data):
-        """Train models for monthly data with row-level features"""
-        X_features = []
-        feature_names = []
-
-        month_encoder = LabelEncoder()
-        valid_months = monthly_data[monthly_data['Month'] != '']['Month']
-        if len(valid_months) > 0:
-            month_encoder.fit(valid_months)
-            X_features.append(month_encoder.transform(monthly_data['Month'].fillna('Unknown')).reshape(-1, 1))
-            feature_names.append('Month')
-
-        for feature in self.row_level_features:
-            if feature in monthly_data.columns:
-                if pd.api.types.is_numeric_dtype(monthly_data[feature]):
-                    feature_data = monthly_data[feature].fillna(monthly_data[feature].median())
-                    X_features.append(feature_data.values.reshape(-1, 1))
-                    feature_names.append(feature)
-                else:
-                    encoder = LabelEncoder()
-                    feature_data = monthly_data[feature].fillna('Unknown')
-                    encoder.fit(feature_data)
-                    X_features.append(encoder.transform(feature_data).reshape(-1, 1))
-                    feature_names.append(feature)
-
-        y = monthly_data['Volumetric Quantity'].values
-
-        if len(X_features) > 0:
-            for i, feature_name in enumerate(feature_names):
-                X = X_features[i]
-                if len(np.unique(X)) > 1:
-                    self.train_and_test_model(X, y, f'Monthly_Linear_{feature_name}',
-                                              'Linear', [feature_name])
-
-            if len(X_features) > 1:
-                X_all = np.hstack(X_features)
-                self.train_and_test_model(X_all, y, 'Monthly_RandomForest_All',
-                                          'RandomForest', feature_names)
-                self.train_and_test_model(X_all, y, 'Monthly_GradientBoosting_All',
-                                          'GradientBoosting', feature_names)
-
-    def train_site_level_models(self):
-        """Train models using site-level features.
-        Prefers monthly rows (captures seasonal variation).
-        Falls back to annual rows when monthly data is insufficient.
-        """
-        monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-        annual_data = self.data_df[self.data_df['Timeframe'] == 'Annual'].copy()
-
-        if len(monthly_data) >= 10:
-            training_data = monthly_data
-            is_monthly = True
-            print(f"  Testing site-level features on {len(training_data)} monthly rows...")
-        elif len(annual_data) >= 3:
-            training_data = annual_data
-            is_monthly = False
-            print(
-                f"  Insufficient monthly rows -- using {len(training_data)} annual rows for site-level feature training")
-        else:
-            print(f"  Insufficient data for site-level feature testing (need >=10 monthly or >=3 annual rows)")
-            return
-
-        for feature in self.site_level_features:
-            if feature not in training_data.columns:
+            nn = self.df[col].dropna()
+            if len(nn) < 4:
                 continue
+            if pd.api.types.is_numeric_dtype(self.df[col]) and nn.nunique() > 1:
+                self.numeric_features.append(col)
+            elif not pd.api.types.is_numeric_dtype(self.df[col]):
+                u = nn.nunique()
+                if 2 <= u <= 30:
+                    self.categorical_features.append(col)
+        print(f"  Numeric features (auto):     {self.numeric_features}")
+        print(f"  Categorical features (auto): {self.categorical_features}")
 
-            feature_availability = training_data[feature].notna().sum() / len(training_data)
-            if feature_availability < 0.2:
-                print(f"     Skipping {feature}: Only {feature_availability:.1%} available")
-                continue
+    # ── Historic ──────────────────────────────────────────────────────────────
 
-            X_features = []
-            feature_names = []
-
-            # Only add Month encoding when training on monthly data
-            if is_monthly and 'Month' in training_data.columns:
-                month_encoder = LabelEncoder()
-                valid_months = training_data[training_data['Month'] != '']['Month']
-                if len(valid_months) > 0:
-                    month_encoder.fit(valid_months)
-                    self.categorical_encoders[f'{feature}_Month'] = month_encoder
-                    X_features.append(
-                        month_encoder.transform(training_data['Month'].fillna('Unknown')).reshape(-1, 1)
-                    )
-                    feature_names.append('Month')
-
-            if pd.api.types.is_numeric_dtype(training_data[feature]):
-                feature_data = training_data[feature].fillna(training_data[feature].median())
-                X_features.append(feature_data.values.reshape(-1, 1))
-                feature_names.append(feature)
-
-                if len(X_features) > 0:
-                    y = training_data['Volumetric Quantity'].values
-                    X_all = np.hstack(X_features)
-
-                    prefix = 'SiteLevel_Monthly' if is_monthly else 'SiteLevel_Annual'
-                    self.train_and_test_model(X_all, y, f'{prefix}_{feature}',
-                                              'Linear', feature_names)
-                    self.train_and_test_model(X_all, y, f'{prefix}_Polynomial_{feature}',
-                                              'Polynomial', feature_names)
-
-        if len(self.site_level_features) > 1:
-            X_features = []
-            feature_names = []
-
-            if is_monthly and 'Month' in training_data.columns:
-                month_encoder = LabelEncoder()
-                valid_months = training_data[training_data['Month'] != '']['Month']
-                if len(valid_months) > 0:
-                    month_encoder.fit(valid_months)
-                    self.categorical_encoders['Combined_Month'] = month_encoder
-                    X_features.append(
-                        month_encoder.transform(training_data['Month'].fillna('Unknown')).reshape(-1, 1)
-                    )
-                    feature_names.append('Month')
-
-            for feature in self.site_level_features:
-                if feature in training_data.columns:
-                    feature_availability = training_data[feature].notna().sum() / len(training_data)
-                    if feature_availability >= 0.2:
-                        if pd.api.types.is_numeric_dtype(training_data[feature]):
-                            feature_data = training_data[feature].fillna(training_data[feature].median())
-                            X_features.append(feature_data.values.reshape(-1, 1))
-                            feature_names.append(feature)
-
-            if len(X_features) >= 2:
-                y = training_data['Volumetric Quantity'].values
-                X_all = np.hstack(X_features)
-
-                prefix = 'SiteLevel_Monthly' if is_monthly else 'SiteLevel_Annual'
-                print(f"  Testing combined model with {len(feature_names)} features on {len(training_data)} rows...")
-
-                self.train_and_test_model(X_all, y, f'{prefix}_RandomForest_All',
-                                          'RandomForest', feature_names)
-                self.train_and_test_model(X_all, y, f'{prefix}_GradientBoosting_All',
-                                          'GradientBoosting', feature_names)
-
-    def train_and_test_model(self, X, y, model_name, model_type, features):
-        """Train and test a model with feature-aware R² calculation.
-        For small datasets (< 10 rows), uses leave-one-out instead of train/test split.
-        """
+    def _load_historic_records(self):
+        print("\n  Loading historic records...")
         try:
-            if len(X) < 3:
+            hrec = (pd.read_csv(self.historic_records_file)
+                    if self.historic_records_file.lower().endswith('.csv')
+                    else pd.read_excel(self.historic_records_file))
+            hrec.columns = hrec.columns.str.strip()
+
+            scol = next((c for c in ['Site identifier', 'Site_identifier', 'Location']
+                         if c in hrec.columns), None)
+            vcol = next((c for c in hrec.columns if 'volumetric' in c.lower()), None)
+            if not scol or not vcol:
+                print("  ⚠  Missing site or VQ column in historic records")
                 return
 
-            # For small datasets use leave-one-out cross-validation
-            if len(X) < 10:
-                from sklearn.model_selection import LeaveOneOut, cross_val_score
-                if model_type == 'Linear':
-                    cv_model = LinearRegression()
-                elif model_type == 'Polynomial':
-                    cv_model = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
-                elif model_type == 'RandomForest':
-                    cv_model = RandomForestRegressor(n_estimators=50, random_state=42)
-                elif model_type == 'GradientBoosting':
-                    cv_model = GradientBoostingRegressor(n_estimators=50, random_state=42)
+            from_col      = next((c for c in hrec.columns if 'date from' in c.lower() or c.lower() == 'date_from'), None)
+            to_col        = next((c for c in hrec.columns if 'date to'   in c.lower() or c.lower() == 'date_to'),   None)
+            integrity_col = next((c for c in hrec.columns if 'data integrity' in c.lower() or c.lower() == 'integrity'), None)
+            h_ghg_col     = next((c for c in hrec.columns if c.lower() in ('ghg category', 'ghg_category')), None)
+            h_ghgsub_col  = next((c for c in hrec.columns if c.lower() in ('ghg sub category', 'ghg_sub_category')), None)
+
+            # Collect all rows keyed by (composite_key, month_or_ANNUAL, year)
+            # so we can handle multiple years properly
+            # Structure: raw_rows[(ckey, period)] = [(year, vq, integrity), ...]
+            from collections import defaultdict
+            raw_rows = defaultdict(list)
+            years_seen = set()
+            historic_integrity = {}
+
+            for _, row in hrec.iterrows():
+                site = row.get(scol)
+                vq   = row.get(vcol)
+                if pd.isna(site) or pd.isna(vq):
+                    continue
+                site = str(site).strip()
+
+                pf = _parse_date(row.get(from_col)) if from_col else None
+                pt = _parse_date(row.get(to_col))   if to_col   else pf
+                tf, mo = _timeframe(pf, pt) if pf else ('Unknown', None)
+                year = pf.year if pf else None
+                if year:
+                    years_seen.add(year)
+
+                period = mo or 'ANNUAL'
+                integ  = None
+                if integrity_col:
+                    iv = row.get(integrity_col)
+                    integ = str(iv).strip() if pd.notna(iv) else None
+
+                # Build composite key matching the same logic as the main file
+                ghg     = str(row.get(h_ghg_col,    '')).strip() if h_ghg_col    else ''
+                ghg_sub = str(row.get(h_ghgsub_col, '')).strip() if h_ghgsub_col else ''
+                if ghg and ghg_sub and self.ghg_sub_col:
+                    ckey = (site, ghg, ghg_sub)
+                elif ghg and self.ghg_col:
+                    ckey = (site, ghg)
                 else:
-                    return
-                loo = LeaveOneOut()
-                scores = cross_val_score(cv_model, X, y, cv=loo, scoring='r2')
-                r2_full = float(np.mean(scores))
-                cv_model.fit(X, y)
-                self.models[model_name] = {
-                    'model': cv_model, 'features': features,
-                    'base_features': features, 'derived_features': [],
-                    'r2': r2_full, 'r2_full': r2_full, 'r2_imputed': r2_full,
-                    'type': model_type, 'has_derived': False,
-                    'description': f"{model_type} using {', '.join(features)}. LOO CV R²={r2_full:.3f} ({len(X)} rows)"
-                }
-                print(f"  ✓ {model_name}: R² = {r2_full:.4f} (LOO CV, {len(X)} rows)")
-                return
+                    ckey = (site,)
 
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.33, random_state=42
-            )
+                raw_rows[(ckey, period)].append((year, float(vq), integ))
 
-            if model_type == 'Linear':
-                model = LinearRegression()
-                description = f"Linear Regression using {', '.join(features)}"
-            elif model_type == 'Polynomial':
-                model = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
-                description = f"Polynomial Regression (degree 2) using {', '.join(features)}"
-            elif model_type == 'RandomForest':
-                model = RandomForestRegressor(n_estimators=100, random_state=42)
-                description = f"Random Forest (100 trees) using {', '.join(features)}"
-            elif model_type == 'GradientBoosting':
-                model = GradientBoostingRegressor(n_estimators=100, random_state=42)
-                description = f"Gradient Boosting (100 estimators) using {', '.join(features)}"
-            else:
-                return
+            # ── Determine current year range ──────────────────────────────────
+            curr_yrs = set()
+            fc = self._col(['Date from', 'Date_from'])
+            if fc:
+                for v in self.df[fc].dropna():
+                    p = _parse_date(v)
+                    if p:
+                        curr_yrs.add(p.year)
+            past_yrs = years_seen - curr_yrs
+            if past_yrs:
+                self.historic_year = max(past_yrs)
 
-            model.fit(X_train, y_train)
+            # ── For each composite key + period: pick most recent year ────────
+            # Also compute growth rate if multiple years available
+            # growth_rates[(ckey)] = avg annual % change across all periods
+            growth_accumulator = defaultdict(list)  # ckey -> [yoy_ratios]
 
-            y_pred = model.predict(X_test)
-            r2_full = r2_score(y_test, y_pred)
+            for (ckey, period), year_rows in raw_rows.items():
+                # Sort by year
+                year_rows_sorted = sorted(
+                    [(y, vq, integ) for y, vq, integ in year_rows if y is not None],
+                    key=lambda x: x[0]
+                )
+                no_year = [(y, vq, integ) for y, vq, integ in year_rows if y is None]
 
-            from historic_model_training import identify_derived_features
-            base_features, derived_features = identify_derived_features(features)
+                if year_rows_sorted:
+                    # Most recent year wins as anchor
+                    _, best_vq, best_integ = year_rows_sorted[-1]
+                    self.historic_vq.setdefault(ckey, {})[period] = best_vq
 
-            r2_imputed = r2_full
+                    if best_integ:
+                        historic_integrity.setdefault(ckey, {})[period] = best_integ
 
-            if len(derived_features) > 0:
-                X_test_imputed = X_test.copy()
+                    # Compute year-on-year growth ratios for this period
+                    for i in range(1, len(year_rows_sorted)):
+                        y0, vq0, _ = year_rows_sorted[i-1]
+                        y1, vq1, _ = year_rows_sorted[i]
+                        yr_gap = y1 - y0
+                        if yr_gap > 0 and vq0 > 0 and vq1 > 0:
+                            annual_ratio = (vq1 / vq0) ** (1.0 / yr_gap)
+                            growth_accumulator[ckey].append(annual_ratio)
+                elif no_year:
+                    _, best_vq, best_integ = no_year[-1]
+                    self.historic_vq.setdefault(ckey, {})[period] = best_vq
+                    if best_integ:
+                        historic_integrity.setdefault(ckey, {})[period] = best_integ
 
-                for i, feature in enumerate(features):
-                    if feature in derived_features:
-                        median_val = np.median(X_train[:, i])
-                        X_test_imputed[:, i] = median_val
+            # ── Compute per-key growth rate (median of all period ratios) ──────
+            for ckey, ratios in growth_accumulator.items():
+                if ratios:
+                    self.historic_growth_rates[ckey] = float(np.median(ratios))
 
-                y_pred_imputed = model.predict(X_test_imputed)
-                r2_imputed = r2_score(y_test, y_pred_imputed)
+            # ── Anchor quality (informational only — no longer gates selection) ─
+            self.historic_anchor_quality = {}
+            for ckey in self.historic_vq:
+                if not integrity_col or ckey not in historic_integrity:
+                    self.historic_anchor_quality[ckey] = 'unknown'
+                    continue
+                site_integ = historic_integrity[ckey]
+                if 'ANNUAL' in site_integ:
+                    val = site_integ['ANNUAL']
+                    self.historic_anchor_quality[ckey] = 'good' if (val and val.lower() == 'actual') else 'poor'
+                else:
+                    n_actual = sum(1 for v in site_integ.values() if v and v.lower() == 'actual')
+                    self.historic_anchor_quality[ckey] = 'good' if n_actual >= 3 else 'poor'
 
-            self.models[model_name] = {
-                'model': model,
-                'features': features,
-                'base_features': base_features,
-                'derived_features': derived_features,
-                'r2': r2_full,
-                'r2_full': r2_full,
-                'r2_imputed': r2_imputed,
-                'type': model_type,
-                'has_derived': len(derived_features) > 0,
-                'description': f"{description}. R²(full)={r2_full:.3f}, R²(imputed)={r2_imputed:.3f}" if len(
-                    derived_features) > 0 else f"{description}. R²={r2_full:.3f}"
-            }
-
-            if len(derived_features) > 0:
-                print(f"  ✓ {model_name}: R²(full) = {r2_full:.4f}, R²(imputed) = {r2_imputed:.4f}")
-            else:
-                print(f"  ✓ {model_name}: R² = {r2_full:.4f}")
+            n_keys_with_growth = len(self.historic_growth_rates)
+            n_multi_year = sum(1 for ratios in growth_accumulator.values() if ratios)
+            print(f"  Historic records: {len(self.historic_vq)} site+category keys, "
+                  f"year={self.historic_year}")
+            print(f"  Years in historic file: {sorted(years_seen)}")
+            if n_multi_year:
+                print(f"  Multi-year growth rates computed for {n_keys_with_growth} keys "
+                      f"(used to project forward)")
 
         except Exception as e:
-            print(f"  ✗ {model_name} failed: {str(e)}")
-
-    def train_intensity_models(self, numeric_features):
-        """
-        Train VQ ~ Feature intensity models for every available numeric feature.
-
-        These are always trained regardless of data format (annual or monthly)
-        and always visible in the model list so results can be compared against
-        what analysts would compute manually (e.g. VQ/Turnover intensity).
-
-        Models trained:
-          - Intensity_Linear_{Feature}     : VQ ~ Feature (simple linear, no seasonality)
-          - Intensity_Poly_{Feature}       : VQ ~ Feature + Feature² (polynomial)
-          - Intensity_Linear_All           : VQ ~ all features combined (linear)
-          - Intensity_Poly_All             : VQ ~ all features combined (polynomial)
-
-        For monthly datasets, also trains non-seasonal monthly variants:
-          - Intensity_Monthly_Linear_{Feature} : same but trained only on monthly rows
-        """
-        # Use all rows with VQ data — both annual and monthly
-        all_data = self.data_df.copy()
-        monthly_data = all_data[all_data['Timeframe'] == 'Monthly']
-        annual_data = all_data[all_data['Timeframe'] == 'Annual']
-
-        valid_features = []
-        for feat in numeric_features:
-            avail = all_data[feat].notna().sum()
-            if avail >= 3:
-                valid_features.append(feat)
-            else:
-                print(f"  Skipping {feat}: only {avail} non-null values")
-
-        if not valid_features:
-            print("  No features with sufficient data for intensity models")
-            return
-
-        y_all = all_data['Volumetric Quantity'].values
-
-        # Single-feature models
-        for feat in valid_features:
-            feat_data = all_data[feat].fillna(all_data[feat].median())
-            X = feat_data.values.reshape(-1, 1)
-
-            self.train_and_test_model(X, y_all, f'Intensity_Linear_{feat}',
-                                      'Linear', [feat])
-            self.train_and_test_model(X, y_all, f'Intensity_Poly_{feat}',
-                                      'Polynomial', [feat])
-
-            # Also train on monthly-only rows if we have enough
-            if len(monthly_data) >= 3:
-                feat_monthly = monthly_data[feat].fillna(monthly_data[feat].median())
-                X_m = feat_monthly.values.reshape(-1, 1)
-                y_m = monthly_data['Volumetric Quantity'].values
-                self.train_and_test_model(X_m, y_m, f'Intensity_Monthly_Linear_{feat}',
-                                          'Linear', [feat])
-
-        # Multi-feature combined models (only when 2+ features available)
-        if len(valid_features) >= 2:
-            X_parts = []
-            for feat in valid_features:
-                feat_data = all_data[feat].fillna(all_data[feat].median())
-                X_parts.append(feat_data.values.reshape(-1, 1))
-
-            X_all = np.hstack(X_parts)
-            self.train_and_test_model(X_all, y_all, 'Intensity_Linear_All',
-                                      'Linear', valid_features)
-            self.train_and_test_model(X_all, y_all, 'Intensity_Poly_All',
-                                      'Polynomial', valid_features)
-
-            if len(monthly_data) >= 3:
-                X_m_parts = []
-                for feat in valid_features:
-                    feat_monthly = monthly_data[feat].fillna(monthly_data[feat].median())
-                    X_m_parts.append(feat_monthly.values.reshape(-1, 1))
-                X_m_all = np.hstack(X_m_parts)
-                y_m = monthly_data['Volumetric Quantity'].values
-                self.train_and_test_model(X_m_all, y_m, 'Intensity_Monthly_Linear_All',
-                                          'Linear', valid_features)
-                self.train_and_test_model(X_m_all, y_m, 'Intensity_Monthly_Poly_All',
-                                          'Polynomial', valid_features)
-
-    def train_site_seasonal_model(self):
-        """Train model using site averages with seasonal patterns"""
-        monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-
-        if len(monthly_data) == 0:
-            return
-
-        site_avgs = monthly_data.groupby('Site identifier')['Volumetric Quantity'].mean().to_dict()
-
-        predictions = []
-        actuals = []
-
-        for idx, row in monthly_data.iterrows():
-            site_id = row['Site identifier']
-            month = row['Month']
-
-            if site_id in site_avgs and month:
-                brand = row.get('Brand', 'Overall')
-                pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-
-                if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                    seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                    prediction = site_avgs[site_id] * seasonal_factor
-                    predictions.append(prediction)
-                    actuals.append(row['Volumetric Quantity'])
-
-        if len(predictions) > 0:
-            r2 = r2_score(actuals, predictions)
-            self.models['Site_Seasonal'] = {
-                'model': 'site_seasonal',
-                'features': ['Site identifier', 'Month'],
-                'r2': r2,
-                'site_avgs': site_avgs,
-                'type': 'Site_Seasonal',
-                'description': f'Site-specific average adjusted by seasonal patterns. Tested on {len(predictions)} monthly data points with actual values.'
-            }
-            print(f"\n  ✓ Site_Seasonal: R² = {r2:.4f} (tested on {len(predictions)} points)")
-
-    def create_seasonal_variants(self):
-        """Create seasonal variants of site-level models that DON'T already include Month."""
-        monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-
-        if len(monthly_data) == 0 or len(self.seasonal_patterns.get('Overall', {})) == 0:
-            return
-
-        site_level_models = {k: v for k, v in self.models.items()
-                             if k.startswith('SiteLevel_')
-                             and 'Month' not in v.get('features', [])}
-
-        if len(site_level_models) == 0:
-            return
-
-        print("\n📊 Creating seasonal variants for annual-only site-level models...")
-
-        for base_model_name, base_model_info in site_level_models.items():
-            try:
-                predictions = []
-                actuals = []
-
-                for idx, row in monthly_data.iterrows():
-                    month = row.get('Month')
-                    if not month:
-                        continue
-
-                    base_pred = self.apply_model_to_row(row, base_model_info)
-                    if base_pred is None or base_pred <= 0:
-                        continue
-
-                    brand = row.get('Brand', 'Overall')
-                    pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-
-                    if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                        seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                        monthly_pred = (base_pred / 12) * seasonal_factor
-
-                        predictions.append(monthly_pred)
-                        actuals.append(row['Volumetric Quantity'])
-
-                if len(predictions) >= 10:
-                    r2 = r2_score(actuals, predictions)
-                    seasonal_model_name = f"{base_model_name}_Seasonal"
-
-                    self.models[seasonal_model_name] = {
-                        'model': base_model_info['model'],
-                        'features': base_model_info['features'] + ['Month'],
-                        'r2': r2,
-                        'r2_full': r2,
-                        'r2_imputed': r2,
-                        'type': f"{base_model_info['type']}_Seasonal",
-                        'base_model': base_model_name,
-                        'has_derived': False,
-                        'description': f"{base_model_info.get('description', '')} with seasonal adjustment."
-                    }
-                    print(f"  ✓ {seasonal_model_name}: R² = {r2:.4f}")
-
-            except Exception as e:
-                print(f"  ✗ Failed to create seasonal variant of {base_model_name}: {str(e)}")
-
-    def train_annual_average_model(self):
-        """Train model using annual averages"""
-        annual_data = self.data_df[self.data_df['Timeframe'] == 'Annual'].copy()
-
-        monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly'].copy()
-        site_month_counts = monthly_data.groupby('Site identifier').size()
-        complete_sites = site_month_counts[site_month_counts == 12].index
-
-        annual_values = list(annual_data['Volumetric Quantity'].values)
-
-        for site in complete_sites:
-            site_data = monthly_data[monthly_data['Site identifier'] == site]
-            annual_total = site_data['Volumetric Quantity'].sum()
-            annual_values.append(annual_total)
-
-        if len(annual_values) > 0:
-            avg_annual = np.mean(annual_values)
-
-            predictions = [avg_annual] * len(annual_values)
-            actuals = annual_values
-
-            ss_res = sum((actual - pred) ** 2 for actual, pred in zip(actuals, predictions))
-            ss_tot = sum((actual - np.mean(actuals)) ** 2 for actual in actuals)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-
-            self.models['Annual_Average'] = {
-                'model': 'annual_average',
-                'features': ['Annual'],
-                'r2': r2,
-                'average': avg_annual,
-                'type': 'Annual_Average',
-                'description': f'Simple average of annual totals. Calculated from {len(annual_values)} annual data points.'
-            }
-            print(f"  ✓ Annual_Average: R² = {r2:.4f} (calculated from {len(annual_values)} annual totals)")
-
-    def get_quality_score_for_row(self, row, model_name):
-        """Get data quality score (R²) for a prediction based on available features."""
-        if model_name not in self.models:
-            return 0.3
-
-        model_info = self.models[model_name]
-        model_r2 = model_info.get('r2', 0.3)
-
-        model_features = model_info.get('features', [])
-
-        available_features = []
-        for feature in model_features:
-            if feature in ['Month', 'Historic VQ']:
-                available_features.append(feature)
-            elif feature in row.index and pd.notna(row[feature]):
-                available_features.append(feature)
-
-        if hasattr(self, 'historic_trainer') and self.historic_trainer:
-            feature_key = tuple(sorted(available_features))
-            feature_r2 = self.historic_trainer.feature_set_r2.get(feature_key)
-            if feature_r2 is not None:
-                return feature_r2
-
-        return model_r2
-
-    def extrapolate_blank_rows(self):
-        """Fill in blank rows using scenario-based model selection"""
-        print("\n" + "=" * 60)
-        print("MAKING PREDICTIONS (SCENARIO-BASED)")
-        print("=" * 60)
-
-        self.scenario_selector = ScenarioBasedModelSelector(
-            data_df=self.data_df,
-            blank_df=self.blank_df,
-            models=self.models,
-            historic_manager=self.historic_manager,
-            seasonal_patterns=self.seasonal_patterns
-        )
-
-        self.scenario_selector.find_best_models_for_all_scenarios()
-
-        results = []
-
-        for idx, row in self.blank_df.iterrows():
-            scenario = self.scenario_selector.identify_scenario(row)
-            best_model_name, scenario_r2 = self.scenario_selector.get_best_model_for_row(row)
-
-            if best_model_name:
-                prediction = self._apply_model_to_row_safe(row, best_model_name)
-
-                if best_model_name in self.models:
-                    if 'predictions_made' not in self.models[best_model_name]:
-                        self.models[best_model_name]['predictions_made'] = 0
-                    self.models[best_model_name]['predictions_made'] += 1
-            else:
-                best_model_name = None
-                scenario_r2 = 0.3
-                prediction = None
-
-            if prediction is None or prediction <= 0:
-                if row['Timeframe'] == 'Monthly':
-                    monthly_data = self.data_df[self.data_df['Timeframe'] == 'Monthly']
-                    prediction = monthly_data['Volumetric Quantity'].mean()
-                    best_model_name = 'Overall_Monthly_Average'
-                    scenario_r2 = 0.3
-                elif row['Timeframe'] == 'Annual':
-                    annual_data = self.data_df[self.data_df['Timeframe'] == 'Annual']
-                    if len(annual_data) > 0:
-                        prediction = annual_data['Volumetric Quantity'].mean()
-                    else:
-                        prediction = self.data_df['Volumetric Quantity'].mean()
-                    best_model_name = 'Overall_Annual_Average'
-                    scenario_r2 = 0.3
-                else:
-                    prediction = self.data_df['Volumetric Quantity'].mean()
-                    best_model_name = 'Overall_Average'
-                    scenario_r2 = 0.3
-
-            timeframe_type, months_bucket, features_key, has_historic = scenario
-
-            # Defensive: handle old-style scenarios where features_key might be a boolean
-            if not isinstance(features_key, (tuple, list)):
-                features_key = tuple()
-
-            results.append({
-                'index': idx,
-                'prediction': prediction,
-                'model': best_model_name,
-                'r2': scenario_r2,
-                'context_months': months_bucket,
-                'features_key': list(features_key),
-                'context_has_historic': has_historic
-            })
-
-        self.scenario_selector.print_scenario_summary()
-        print(f"\n✓ Made {len(results)} predictions using scenario-based selection")
-
-        return results
-
-    def predict_monthly_row(self, row):
-        """Predict a single monthly row using feature-aware R² selection"""
-        site_id = row.get('Site identifier')
-        month = row.get('Month')
-        best_r2 = -float('inf')
-        prediction = None
-        best_model_name = None
-
-        candidates = []
-
-        if self.has_historic_data and self.historic_manager:
-            for model_name in ['LastYear_TurnoverAdjusted', 'LastYear_Direct',
-                               'MultiYear_Average', 'LastYear_GrowthAdjusted']:
-                if model_name in self.models:
-                    pred = self.apply_historic_model(row, model_name)
-                    if pred and pred > 0:
-                        effective_r2 = self.models[model_name]['r2']
-                        candidates.append((pred, effective_r2, model_name))
-
-            for model_name in ['Historic_Monthly_RandomForest', 'Historic_Monthly_GradientBoosting']:
-                if model_name in self.models:
-                    pred = self.apply_ml_model_historic(row, model_name)
-                    if pred and pred > 0:
-                        effective_r2 = get_effective_r2_for_row(self.models[model_name], row)
-                        candidates.append((pred, effective_r2, model_name))
-
-        if 'Site_Seasonal' in self.models and month:
-            model_info = self.models['Site_Seasonal']
-            site_avgs = model_info.get('site_avgs', {})
-
-            if site_id in site_avgs:
-                site_avg = site_avgs[site_id]
-            elif len(site_avgs) > 0:
-                site_avg = np.mean(list(site_avgs.values()))
-            else:
-                site_avg = None
-
-            if site_avg:
-                brand = row.get('Brand', 'Overall')
-                pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-
-                if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                    seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                    pred = site_avg * seasonal_factor
-                    effective_r2 = model_info['r2']
-                    candidates.append((pred, effective_r2, 'Site_Seasonal'))
-
-        for model_name, model_info in self.models.items():
-            if model_name.endswith('_Seasonal') and model_name.startswith('SiteLevel_'):
-                base_model_info = self.models.get(model_info.get('base_model'))
-                if base_model_info:
-                    base_pred = self.apply_model_to_row(row, base_model_info)
-                    if base_pred and base_pred > 0 and month:
-                        brand = row.get('Brand', 'Overall')
-                        pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                        if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                            seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                            pred = (base_pred / 12) * seasonal_factor
-                            effective_r2 = get_effective_r2_for_row(model_info, row)
-                            candidates.append((pred, effective_r2, model_name))
-
-        for model_name, model_info in self.models.items():
-            if model_name.startswith('Monthly_'):
-                pred = self.apply_model_to_row(row, model_info)
-                if pred and pred > 0:
-                    effective_r2 = get_effective_r2_for_row(model_info, row)
-                    candidates.append((pred, effective_r2, model_name))
-
-        for model_name, model_info in self.models.items():
-            if model_name.startswith('Historic_SiteLevel_Monthly_'):
-                pred = self.apply_model_to_row(row, model_info)
-                if pred and pred > 0:
-                    effective_r2 = get_effective_r2_for_row(model_info, row)
-                    candidates.append((pred, effective_r2, model_name))
-
-        if month:
-            month_data = self.data_df[
-                (self.data_df['Month'] == month) &
-                (self.data_df['Timeframe'] == 'Monthly')
-                ]
-            if len(month_data) > 0:
-                pred = month_data['Volumetric Quantity'].mean()
-                candidates.append((pred, 0.6, f'Monthly_Average_{month}'))
-
-        if candidates:
-            best = max(candidates, key=lambda x: x[1])
-            return best[0], best[2], best[1]
-
-        return None, None, -float('inf')
-
-    def predict_annual_row(self, row):
-        """Predict a single annual row using feature-aware R² selection"""
-        candidates = []
-
-        for model_name, model_info in self.models.items():
-            if (model_name.startswith('SiteLevel_') or
-                    model_name.startswith('Historic_SiteLevel_') or
-                    model_name == 'Annual_Average'):
-
-                if model_name.endswith('_Seasonal'):
-                    continue
-                if model_info.get('type') == 'rule_based':
-                    continue
-
-                pred = self.apply_model_to_row(row, model_info)
-                if pred and pred > 0:
-                    effective_r2 = get_effective_r2_for_row(model_info, row)
-                    candidates.append((pred, effective_r2, model_name))
-
-        if candidates:
-            best = max(candidates, key=lambda x: x[1])
-            return best[0], best[2], best[1]
-
-        return None, None, -float('inf')
-
-    def apply_historic_model(self, row, model_name):
-        """
-        Apply a rule-based historic model using period-based matching.
-        ✅ FIXED: Uses month-specific feature values (e.g. Turnover) where available.
-        """
-        if not self.has_historic_data:
-            return None
-
-        site = row['Site identifier']
-        month = row['Month']
-        row_date = pd.to_datetime(row['Date from'])
-
-        recent_period = self.historic_manager.get_most_recent_period(site, row_date)
-
-        if not recent_period:
-            return None
-
-        if model_name == 'LastYear_TurnoverAdjusted':
-            period_vq = self.historic_manager.get_period_vq_for_month(recent_period, month)
-
-            if not period_vq:
-                annual = self.historic_manager.get_period_annual_total(recent_period)
-                if annual and month:
-                    monthly_avg = annual / recent_period.months_covered
-                    brand = row.get('Brand', 'Overall')
-                    pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                    if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                        seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                        period_vq = monthly_avg * seasonal_factor
-
-            if not period_vq:
-                return None
-
-            current_turnover = row.get('Turnover')
-            # ✅ PATCH B: Use month-specific historic Turnover if available
-            period_turnover = self.historic_manager.get_period_feature(recent_period, 'Turnover', month=month)
-
-            if pd.notna(current_turnover) and period_turnover and period_turnover != 0:
-                adjustment = float(current_turnover) / float(period_turnover)
-                return period_vq * adjustment
-            else:
-                return period_vq
-
-        elif model_name == 'LastYear_Direct':
-            month_vq = self.historic_manager.get_period_vq_for_month(recent_period, month)
-
-            if month_vq:
-                return month_vq
-
-            annual = self.historic_manager.get_period_annual_total(recent_period)
-            if annual and month:
-                monthly_avg = annual / recent_period.months_covered
-                brand = row.get('Brand', 'Overall')
-                pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                    seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                    return monthly_avg * seasonal_factor
-
-            return None
-
-        elif model_name == 'MultiYear_Average':
-            all_periods = self.historic_manager.get_all_periods(site)
-            relevant_periods = [p for p in all_periods if p.end_date < row_date]
-
-            if len(relevant_periods) < 1:
-                return None
-
-            monthly_values = []
-            for period in relevant_periods:
-                month_vq = self.historic_manager.get_period_vq_for_month(period, month)
-
-                if month_vq:
-                    monthly_values.append(month_vq)
-                else:
-                    annual = self.historic_manager.get_period_annual_total(period)
-                    if annual and month:
-                        monthly_avg = annual / period.months_covered
-                        brand = row.get('Brand', 'Overall')
-                        pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                        if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                            seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                            monthly_values.append(monthly_avg * seasonal_factor)
-
-            if monthly_values:
-                return sum(monthly_values) / len(monthly_values)
-
-            return None
-
-        elif model_name == 'LastYear_GrowthAdjusted':
-            all_periods = self.historic_manager.get_all_periods(site)
-            relevant_periods = [p for p in all_periods if p.end_date < row_date]
-
-            if len(relevant_periods) < 2:
-                return None
-
-            recent_two = relevant_periods[-2:]
-
-            prev_total = recent_two[0].get_normalized_annual()
-            recent_total = recent_two[1].get_normalized_annual()
-
-            if not prev_total or not recent_total or prev_total == 0:
-                return None
-
-            growth_rate = (recent_total - prev_total) / prev_total
-
-            month_vq = self.historic_manager.get_period_vq_for_month(recent_two[1], month)
-
-            if not month_vq:
-                annual = self.historic_manager.get_period_annual_total(recent_two[1])
-                if annual and month:
-                    monthly_avg = annual / recent_two[1].months_covered
-                    brand = row.get('Brand', 'Overall')
-                    pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                    if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                        seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                        month_vq = monthly_avg * seasonal_factor
-
-            if month_vq:
-                return month_vq * (1 + growth_rate)
-
-            return None
-
-        elif model_name.startswith('SimilarSites_'):
-            return self.apply_similar_sites_prediction(row, model_name)
-
-        return None
-
-    def apply_similar_sites_prediction(self, row, model_name):
-        """Apply similar sites method to predict VQ."""
-        if model_name not in self.models:
-            return None
-
-        model_info = self.models[model_name]
-        method_config = model_info.get('method_config')
-
-        if not method_config:
-            return None
-
-        site = row['Site identifier']
-        month = row['Month']
-        row_date = pd.to_datetime(row['Date from'], dayfirst=True)
-
-        historic_period = self.historic_manager.get_most_recent_period(site, row_date)
-        if not historic_period:
-            return None
-
-        similar_sites = self.historic_trainer._find_similar_sites(
-            site,
-            [s for s in self.df['Site identifier'].unique() if s != site],
-            self.df,
-            method_config
-        )
-
-        if len(similar_sites) == 0:
-            return None
-
-        growth_rates = []
-
-        for sim_site in similar_sites:
-            sim_site_data = self.df[
-                (self.df['Site identifier'] == sim_site) &
-                (self.df['Month'] == month) &
-                (self.df['Volumetric Quantity'].notna())
-                ]
-
-            if len(sim_site_data) == 0:
-                continue
-
-            sim_current_vq = sim_site_data.iloc[0]['Volumetric Quantity']
-            sim_current_date = pd.to_datetime(sim_site_data.iloc[0]['Date from'], dayfirst=True)
-
-            sim_historic_period = self.historic_manager.get_most_recent_period(sim_site, sim_current_date)
-            if not sim_historic_period:
-                continue
-
-            sim_historic_vq = self.historic_manager.get_period_vq_for_month(sim_historic_period, month)
-
-            if not sim_historic_vq:
-                sim_annual = self.historic_manager.get_period_annual_total(sim_historic_period)
-                if sim_annual:
-                    sim_historic_vq = sim_annual / sim_historic_period.months_covered
-
-            if sim_historic_vq and sim_historic_vq > 0:
-                growth_rate = sim_current_vq / sim_historic_vq
-                growth_rates.append(growth_rate)
-
-        if len(growth_rates) == 0:
-            return None
-
-        target_historic_vq = self.historic_manager.get_period_vq_for_month(historic_period, month)
-
-        if not target_historic_vq:
-            target_annual = self.historic_manager.get_period_annual_total(historic_period)
-            if target_annual:
-                monthly_avg = target_annual / historic_period.months_covered
-                brand = row.get('Brand', 'Overall')
-                pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-                if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-                    seasonal_factor = self.seasonal_patterns[pattern_key][month]
-                    target_historic_vq = monthly_avg * seasonal_factor
-
-        if not target_historic_vq:
-            return None
-
-        avg_growth = np.mean(growth_rates)
-        return target_historic_vq * avg_growth
-
-    def apply_ml_model_historic(self, row, model_name):
-        """Apply an ML model trained with historic features"""
-        if model_name not in self.models:
-            return None
-
-        model_info = self.models[model_name]
-
-        try:
-            feature_values = []
-
-            for feature in model_info['features']:
-                if feature == 'Month':
-                    if 'Month' in self.historic_trainer.categorical_encoders:
-                        encoder = self.historic_trainer.categorical_encoders['Month']
-                        month_val = row.get('Month', 'Unknown')
-                        try:
-                            encoded = encoder.transform([month_val])[0]
-                        except:
-                            encoded = 0
-                        feature_values.append(encoded)
-                elif feature in row.index:
-                    val = row[feature]
-                    if pd.notna(val):
-                        feature_values.append(float(val))
-                    else:
-                        feature_values.append(0)
-                else:
-                    return None
-
-            if len(feature_values) != len(model_info['features']):
-                return None
-
-            X = np.array(feature_values).reshape(1, -1)
-            return model_info['model'].predict(X)[0]
-
-        except:
-            return None
-
-    def apply_model_to_row(self, row, model_info):
-        """Apply a trained model to make a prediction for a single row"""
-        if model_info['type'] == 'Annual_Average':
-            return model_info['average']
-
-        features = model_info['features']
-        feature_values = []
-
-        for feature in features:
-            if feature == 'Month':
-                if pd.notna(row.get('Month')) and row.get('Month') != '':
-                    months_list = ['January', 'February', 'March', 'April', 'May', 'June',
-                                   'July', 'August', 'September', 'October', 'November', 'December']
-                    month_val = months_list.index(row['Month']) if row['Month'] in months_list else 0
-                    feature_values.append(month_val)
-                else:
-                    feature_values.append(0)
-            elif feature in row.index:
-                val = row[feature]
-                if pd.notna(val):
-                    if feature in self.categorical_features:
-                        unique_vals = self.data_df[feature].dropna().unique()
-                        if val in unique_vals:
-                            feature_values.append(list(unique_vals).index(val))
-                        else:
-                            feature_values.append(0)
-                    else:
-                        feature_values.append(float(val))
-                else:
-                    median_val = self.data_df[feature].median()
-                    feature_values.append(median_val if pd.notna(median_val) else 0)
-            else:
-                return None
-
-        if len(feature_values) != len(features):
-            return None
-
-        X = np.array(feature_values).reshape(1, -1)
-        return model_info['model'].predict(X)[0]
-
-    def _apply_model_to_row_safe(self, row, model_name):
-        """Safely apply a model to a row, handling different model types."""
-        if model_name not in self.models:
-            return None
-
-        model_info = self.models[model_name]
-
-        try:
-            if model_info.get('type') in ['LastYear_Direct', 'LastYear_TurnoverAdjusted',
-                                          'MultiYear_Average', 'LastYear_GrowthAdjusted']:
-                return self.apply_historic_model(row, model_name)
-
-            elif model_info.get('type') == 'Site_Seasonal':
-                return self._predict_site_seasonal_safe(row, model_info)
-
-            elif model_info.get('type') == 'Annual_Average':
-                return model_info.get('average')
-
-            else:
-                return self.apply_model_to_row(row, model_info)
-
-        except Exception as e:
-            return None
-
-    def _predict_site_seasonal_safe(self, row, model_info):
-        """Safely predict using Site_Seasonal model"""
-        site_id = row.get('Site identifier')
-        month = row.get('Month')
-
-        if not site_id or not month:
-            return None
-
-        site_avgs = model_info.get('site_avgs', {})
-
-        if site_id in site_avgs:
-            site_avg = site_avgs[site_id]
-        elif len(site_avgs) > 0:
-            site_avg = np.mean(list(site_avgs.values()))
-        else:
-            return None
-
-        brand = row.get('Brand', 'Overall')
-        pattern_key = brand if brand in self.seasonal_patterns else 'Overall'
-
-        if pattern_key in self.seasonal_patterns and month in self.seasonal_patterns[pattern_key]:
-            seasonal_factor = self.seasonal_patterns[pattern_key][month]
-            return site_avg * seasonal_factor
-
-        return site_avg
-
-    def create_output_dataframe(self, extrapolation_results):
-        """Combine original data with extrapolated values"""
-        output_df = self.df.copy()
-
-        output_df['Data integrity'] = 'Actual'
-        output_df['Estimation Method'] = ''
-        output_df['Data Quality'] = ''
-        output_df['Data Quality Score'] = np.nan
-        output_df['Data_Months'] = np.nan
-        output_df['Data_Has_Features'] = ''
-        output_df['Data_Has_Historic'] = ''
-        output_df['Data_Availability'] = ''
-
-        for result in extrapolation_results:
-            idx = result['index']
-            output_df.at[idx, 'Volumetric Quantity'] = result['prediction']
-            output_df.at[idx, 'Data integrity'] = 'Estimated'
-            output_df.at[idx, 'Estimation Method'] = result['model']
-            output_df.at[idx, 'Data Quality'] = f"{result['r2']:.3f}"
-            output_df.at[idx, 'Data Quality Score'] = result['r2']
-
-            months = result.get('context_months', 0)
-            features_key = result.get('features_key', [])
-
-            # Defensive: ensure features_key is iterable
-            if not isinstance(features_key, (tuple, list)):
-                features_key = []
-
-            has_historic = result.get('context_has_historic', False)
-
-            output_df.at[idx, 'Data_Months'] = months
-            output_df.at[idx, 'Data_Has_Features'] = ', '.join(features_key) if features_key else 'None'
-            output_df.at[idx, 'Data_Has_Historic'] = 'Yes' if has_historic else 'No'
-
-            site_id = self.df.at[idx, 'Site identifier'] if 'Site identifier' in self.df.columns else None
-            is_new_site = False
-
-            if months == 0 and site_id:
-                is_new_site = True
-                if self.historic_manager and hasattr(self.historic_manager, 'site_periods'):
-                    if site_id in self.historic_manager.site_periods:
-                        if len(self.historic_manager.site_periods[site_id]) > 0:
-                            is_new_site = False
-
-            parts = []
-            if is_new_site:
-                parts.append("New site")
-            else:
-                site_id = self.df.at[idx, 'Site identifier']
-                actual_months = 0
-                if site_id in self.data_df['Site identifier'].values:
-                    site_monthly = self.data_df[
-                        (self.data_df['Site identifier'] == site_id) &
-                        (self.data_df['Timeframe'] == 'Monthly')
-                        ]
-                    actual_months = len(site_monthly)
-
-                parts.append(f"{actual_months} months current data")
-
-            for f in features_key:
-                parts.append(f)
-            if has_historic:
-                parts.append("Historic")
-
-            output_df.at[idx, 'Data_Availability'] = ', '.join(parts)
-
-        return output_df
-
-    def create_model_testing_matrix(self):
-        """Create matrix showing R² for every model tested in every data availability context."""
-        if not hasattr(self, 'scenario_selector') or not self.scenario_selector:
-            return None
-
-        if not hasattr(self.scenario_selector, 'scenario_test_results'):
-            return None
-
-        matrix_data = []
-
-        sorted_scenarios = sorted(
-            self.scenario_selector.scenario_test_results.keys(),
-            key=lambda x: (x[0], not x[1], not x[2])
-        )
-
-        for scenario in sorted_scenarios:
-            timeframe_type, months, features_key, has_historic = scenario
-
-            # Defensive: handle old-style scenarios
-            if not isinstance(features_key, (tuple, list)):
-                features_key = tuple()
-
-            test_results = self.scenario_selector.scenario_test_results[scenario]
-
-            parts = [f"[{timeframe_type}] {months} months"]
-            for f in features_key:
-                parts.append(f)
-            if has_historic:
-                parts.append("Historic")
-
-            data_availability = ", ".join(parts)
-            test_pool = test_results.get('test_pool_size', 0)
-
-            row = {
-                'Data_Availability': data_availability,
-                'Months': months,
-                'Test_Pool': test_pool
-            }
-
-            model_results = test_results.get('model_r2s', {})
-            for model_name, r2 in model_results.items():
-                row[model_name] = round(r2, 4) if r2 is not None else ''
-
-            matrix_data.append(row)
-
-        if not matrix_data:
-            return None
-
-        matrix_df = pd.DataFrame(matrix_data)
-
-        base_cols = ['Data_Availability', 'Months', 'Test_Pool']
-        model_cols = [col for col in matrix_df.columns if col not in base_cols]
-        matrix_df = matrix_df[base_cols + sorted(model_cols)]
-
-        return matrix_df
-
-    def create_model_performance_sheet(self):
-        """Create detailed model performance sheet."""
-        performance_data = []
-
-        for model_name, model_info in self.models.items():
-            r2 = model_info.get('r2', 0)
-            r2_imputed = model_info.get('r2_imputed', r2)
-            features = model_info.get('features', [])
-            description = model_info.get('description', '')
-            model_type = model_info.get('type', 'ML')
-            predictions_made = model_info.get('predictions_made', 0)
-
-            if model_type in ['LastYear_Direct', 'LastYear_TurnoverAdjusted',
-                              'MultiYear_Average', 'LastYear_GrowthAdjusted']:
-                type_label = 'Rule-Based (Historic)'
-            elif model_type == 'Site_Seasonal':
-                type_label = 'Rule-Based (Seasonal)'
-            elif model_type == 'Annual_Average':
-                type_label = 'Rule-Based (Average)'
-            else:
-                type_label = 'ML Model'
-
-            scenarios_matched = 0
-            scenarios_viable = 0
-
-            if hasattr(self, 'scenario_selector') and self.scenario_selector:
-                for scenario, (best_model, _) in self.scenario_selector.scenario_best_models.items():
-                    if best_model == model_name:
-                        scenarios_matched += 1
-
-                if hasattr(self.scenario_selector, 'scenario_test_results'):
-                    for scenario, results in self.scenario_selector.scenario_test_results.items():
-                        model_r2s = results.get('model_r2s', {})
-                        if model_name in model_r2s and model_r2s[model_name] is not None:
-                            if model_r2s[model_name] > 0:
-                                scenarios_viable += 1
-
-            features_str = ', '.join(features) if features else 'N/A'
-
-            performance_data.append({
-                'Model': model_name,
-                'Type': type_label,
-                'Training_R²': r2,
-                'R²_Imputed': r2_imputed if r2_imputed != r2 else '',
-                'Scenarios_Matched': scenarios_matched,
-                'Scenarios_Viable': scenarios_viable,
-                'Features_Used': features_str,
-                'Description': description,
-                'Predictions_Made': predictions_made
-            })
-
-        performance_df = pd.DataFrame(performance_data)
-        performance_df = performance_df.sort_values(
-            ['Scenarios_Matched', 'Training_R²'],
-            ascending=[False, False]
-        )
-
-        return performance_df
-
-    def create_data_availability_sheet(self):
-        """Create data availability summary showing which model was chosen for each context"""
-        if not hasattr(self, 'scenario_selector') or not self.scenario_selector:
-            return None
-
-        availability_data = []
-
-        for scenario, (model_name, r2) in self.scenario_selector.scenario_best_models.items():
-            timeframe_type, months, features_key, has_historic = scenario
-
-            # Defensive: handle old-style scenarios
-            if not isinstance(features_key, (tuple, list)):
-                features_key = tuple()
-
-            context_row_count = sum(
-                1 for _, row in self.blank_df.iterrows()
-                if self.scenario_selector.identify_scenario(row) == scenario
-            )
-
-            test_pool = 0
-            if hasattr(self.scenario_selector, 'scenario_test_results'):
-                test_results = self.scenario_selector.scenario_test_results.get(scenario, {})
-                test_pool = test_results.get('test_pool_size', 0)
-
-            parts = [f"[{timeframe_type}] {months} months"]
-            for f in features_key:
-                parts.append(f)
-            if has_historic:
-                parts.append("Historic")
-
-            availability_data.append({
-                'Data_Availability': ', '.join(parts),
-                'Months': months,
-                'Has_Features': ', '.join(features_key) if features_key else 'None',
-                'Has_Historic': 'Yes' if has_historic else 'No',
-                'Test_Pool_Sites': test_pool,
-                'Best_Model': model_name,
-                'R²_Score': r2,
-                'Rows_Using_This': context_row_count
-            })
-
-        availability_df = pd.DataFrame(availability_data)
-        availability_df = availability_df.sort_values(['Months', 'Has_Features', 'Has_Historic'])
-
-        return availability_df
-
-    def create_training_data_sheet(self):
-        """Create training data sheet showing which models can use each training row.
-        Shows ALL rows with VQ data (both monthly and annual), not just monthly.
-        """
-        training_rows = self.data_df.copy()
-
-        if len(training_rows) == 0:
-            return None
-
-        output_data = []
-
-        for idx, row in training_rows.iterrows():
-            row_data = {
-                'Site_Identifier': row.get('Site identifier', ''),
-                'Timeframe': row.get('Timeframe', ''),
-                'Month': row.get('Month', '') if row.get('Timeframe') == 'Monthly' else 'N/A',
-                'VQ': row.get('Volumetric Quantity', ''),
-            }
-
-            if 'Turnover' in row.index:
-                row_data['Turnover'] = row.get('Turnover', '')
-            if 'Brand' in row.index:
-                row_data['Brand'] = row.get('Brand', '')
-
-            if hasattr(self, 'selected_features') and self.selected_features:
-                for feat in self.selected_features:
-                    if feat in row.index and feat not in row_data:
-                        row_data[feat] = row.get(feat, '')
-
-            for model_name, model_info in self.models.items():
-                required_features = model_info.get('features', [])
-
-                can_use = True
-
-                for feature in required_features:
-                    if feature == 'Month':
-                        if pd.isna(row.get('Month')) or row.get('Month') == '':
-                            can_use = False
-                            break
-                    elif feature == 'Site identifier':
-                        if pd.isna(row.get('Site identifier')) or row.get('Site identifier') == '':
-                            can_use = False
-                            break
-                    elif feature in row.index:
-                        if pd.isna(row.get(feature)):
-                            can_use = False
-                            break
-                    else:
-                        can_use = False
-                        break
-
-                model_type = model_info.get('type', '')
-                if model_type in ['LastYear_Direct', 'LastYear_TurnoverAdjusted', 'MultiYear_Average',
-                                  'LastYear_GrowthAdjusted']:
-                    site_id = row.get('Site identifier')
-                    if self.historic_manager and site_id in self.historic_manager.site_periods:
-                        if len(self.historic_manager.site_periods[site_id]) == 0:
-                            can_use = False
-                    else:
-                        can_use = False
-
-                row_data[model_name] = 'TRUE' if can_use else 'FALSE'
-
-            output_data.append(row_data)
-
-        training_df = pd.DataFrame(output_data)
-
-        base_cols = ['Site_Identifier', 'Month', 'VQ']
-        feature_cols = [col for col in training_df.columns if col not in base_cols and col not in self.models]
-        model_cols = [col for col in training_df.columns if col in self.models]
-
-        final_cols = base_cols + feature_cols + sorted(model_cols)
-        training_df = training_df[[col for col in final_cols if col in training_df.columns]]
-
-        return training_df
-
-    def _detect_yoy_features(self, data_source):
-        """
-        Detect all numeric features present in either the current year data
-        or historic periods, to include in the YoY comparison sheet.
-
-        Returns a list of feature names (excluding VQ and metadata columns).
-        """
-        exclude = {
-            'Site identifier', 'Location', 'GHG Category', 'Date from', 'Date to',
-            'Volumetric Quantity', 'Timeframe', 'Month', 'Data Timeframe',
-            'Data integrity', 'Estimation Method', 'Data Quality', 'Data Quality Score',
-            'Year', 'Years_Since_Baseline', 'Data_Months', 'Data_Has_Features',
-            'Data_Has_Historic', 'Data_Availability', 'Client', 'FY',
-            'Financial Year', 'financial_year'
-        }
-
-        features = set()
-
-        # From current year data — numeric columns only
-        for col in data_source.columns:
-            if col in exclude:
-                continue
-            if any(x in col for x in ['YoY', 'Trend', 'Volatility', 'Growth',
-                                      'Historic_Avg', 'VQ_per_', 'Efficiency_',
-                                      'Cross_Site', 'vs_CrossSite']):
-                continue
-            if pd.api.types.is_numeric_dtype(data_source[col]):
-                if data_source[col].notna().sum() > 0:
-                    features.add(col)
-
-        # From historic periods — any feature stored at period or monthly level
-        for site, periods in self.historic_manager.site_periods.items():
-            for period in periods:
-                features.update(period.features.keys())
-                for mf in period.monthly_features.values():
-                    features.update(mf.keys())
-
-        # Remove anything that looks like metadata
-        features = {f for f in features if f not in exclude}
-
-        return sorted(features)
-
-    def create_historic_analysis_sheet(self, output_df=None):
-        """
-        Create historic data analysis showing YoY comparisons for ALL detected features.
-
-        SMART FORMATTING:
-        - If ALL detected features are annual/repeated in BOTH years → 1 row per site
-        - If any feature varies monthly in either year → 13 rows per site (12 months + TOTAL)
-
-        Features are detected dynamically from current year data AND historic periods,
-        so any numeric feature present in either source will appear in the sheet.
-        """
-        if not self.has_historic_data or not self.historic_manager:
-            return None
-
-        data_source = output_df if output_df is not None else self.df
-
-        required_cols = ['Site identifier', 'Volumetric Quantity']
-        missing_cols = [col for col in required_cols if col not in data_source.columns]
-        if missing_cols:
-            print(f"⚠️  Cannot create historic analysis - missing columns: {missing_cols}")
-            return None
-
-        if 'Month' not in data_source.columns:
-            print(f"⚠️  Cannot create historic analysis - 'Month' column not found")
-            return None
-
-        analysis_data = []
-        bold_cells = []
-
-        try:
-            month_order = ['January', 'February', 'March', 'April', 'May', 'June',
-                           'July', 'August', 'September', 'October', 'November', 'December']
-
-            # ── Detect all features to compare ──────────────────────────────
-            all_features = self._detect_yoy_features(data_source)
-            print(f"\n📊 YoY sheet will include {len(all_features)} features: {all_features}")
-
-            sites_with_both = []
-            for site_id in data_source['Site identifier'].unique():
-                if site_id in self.historic_manager.site_periods:
-                    if len(self.historic_manager.site_periods[site_id]) > 0:
-                        sites_with_both.append(site_id)
-
-            if not sites_with_both:
-                print("⚠️  No sites have both current and historic data for comparison")
-                return None
-
-            row_idx = 0
-
-            for site_id in sorted(sites_with_both):
-                historic_periods = self.historic_manager.site_periods[site_id]
-                if len(historic_periods) == 0:
-                    continue
-
-                period = historic_periods[0]
-                period_year = period.year
-                site_data = data_source[data_source['Site identifier'] == site_id].copy()
-                current_year = self.historic_manager.current_year
-
-                # ── For each feature, determine if it's annual or monthly ──
-                # in BOTH historic and current year
-                feature_info = {}  # {feat: {hist_annual, hist_is_repeated,
-                #          curr_annual, curr_is_repeated}}
-                all_annual = True  # stays True only if every feature is annual in both years
-
-                for feat in all_features:
-                    hist_annual, hist_is_repeated = period.get_annual_feature(feat)
-
-                    # Current year: collect values across months
-                    curr_vals = []
-                    for month in month_order:
-                        md = site_data[site_data['Month'] == month]
-                        if len(md) > 0 and feat in md.columns:
-                            v = md[feat].iloc[0]
-                            if pd.notna(v):
-                                curr_vals.append(float(v))
-
-                    curr_is_repeated = False
-                    curr_annual = None
-                    if curr_vals:
-                        unique_curr = set(round(v, 2) for v in curr_vals)
-                        if len(unique_curr) == 1:
-                            curr_annual = curr_vals[0]
-                            curr_is_repeated = True
-                        else:
-                            curr_annual = sum(curr_vals)
-                            curr_is_repeated = False
-
-                    feature_info[feat] = {
-                        'hist_annual': hist_annual,
-                        'hist_is_repeated': hist_is_repeated,
-                        'curr_annual': curr_annual,
-                        'curr_is_repeated': curr_is_repeated,
-                    }
-
-                    # If any feature varies monthly, we need the monthly layout
-                    if not (hist_is_repeated and curr_is_repeated):
-                        all_annual = False
-
-                if all_annual:
-                    self._create_annual_comparison_row(
-                        site_id, period, period_year, current_year,
-                        site_data, feature_info,
-                        analysis_data, bold_cells, row_idx
-                    )
-                    row_idx += 1
-                else:
-                    row_idx = self._create_monthly_comparison_rows(
-                        site_id, period, period_year, current_year,
-                        site_data, month_order, feature_info,
-                        analysis_data, bold_cells, row_idx
-                    )
-
-            if not analysis_data:
-                return None
-
-            analysis_df = pd.DataFrame(analysis_data)
-            analysis_df._bold_cells = bold_cells
-
-            return analysis_df
-
-        except KeyError as e:
-            print(f"\n⚠️  ERROR in Historic Data Analysis: Missing column: {e}")
-            return None
-        except Exception as e:
-            print(f"\n⚠️  ERROR in Historic Data Analysis: {type(e).__name__}: {e}")
             import traceback
+            print(f"  ⚠  Historic records error: {e}")
             traceback.print_exc()
-            return None
-
-    def _create_annual_comparison_row(self, site_id, period, period_year, current_year,
-                                      site_data, feature_info,
-                                      analysis_data, bold_cells, row_idx):
-        """
-        Create a single annual comparison row when all features are annual/repeated in both years.
-        Loops over all detected features dynamically.
-        """
-        historic_vq_annual = period.get_normalized_annual()
-        current_vq_annual = site_data['Volumetric Quantity'].sum()
-
-        has_extrapolated = False
-        if 'Data integrity' in site_data.columns:
-            has_extrapolated = (site_data['Data integrity'] == 'Estimated').any()
-
-        estimation_method = ''
-        r2_score_val = None
-        if has_extrapolated:
-            extrapolated_rows = site_data[site_data['Data integrity'] == 'Estimated']
-            if len(extrapolated_rows) > 0:
-                if 'Estimation Method' in extrapolated_rows.columns:
-                    estimation_method = extrapolated_rows['Estimation Method'].mode()[0] if len(
-                        extrapolated_rows['Estimation Method'].mode()) > 0 else ''
-                if 'Data Quality Score' in extrapolated_rows.columns:
-                    r2_score_val = extrapolated_rows['Data Quality Score'].mean()
-
-        vq_change = None
-        vq_change_pct = None
-        if historic_vq_annual is not None and current_vq_annual is not None:
-            vq_change = current_vq_annual - historic_vq_annual
-            vq_change_pct = (vq_change / historic_vq_annual * 100) if historic_vq_annual != 0 else None
-
-        flag = None
-        if vq_change_pct is not None:
-            if abs(vq_change_pct) > 50:
-                flag = 'Large change'
-            elif abs(vq_change_pct) < 10:
-                flag = 'Normal'
-            else:
-                flag = 'Moderate'
-
-        row_data = {
-            'Site': site_id,
-            'Month': 'ANNUAL',
-            f'VQ_{period_year}': historic_vq_annual,
-            f'VQ_{current_year}': current_vq_annual,
-            'VQ_Change': vq_change,
-            'VQ_Change_%': round(vq_change_pct, 1) if vq_change_pct is not None else None,
-        }
-
-        # ── Dynamic feature columns ──────────────────────────────────────────
-        for feat, info in feature_info.items():
-            hist_val = info['hist_annual']
-            curr_val = info['curr_annual']
-
-            change = None
-            change_pct = None
-            if hist_val is not None and curr_val is not None and hist_val != 0:
-                change = curr_val - hist_val
-                change_pct = round((change / hist_val) * 100, 1)
-
-            row_data[f'{feat}_{period_year}'] = hist_val
-            row_data[f'{feat}_{current_year}'] = curr_val
-            row_data[f'{feat}_Change'] = change
-            row_data[f'{feat}_Change_%'] = change_pct
-
-        row_data['Estimation Method'] = estimation_method
-        row_data['Data Quality Score'] = round(r2_score_val, 3) if r2_score_val is not None else None
-        row_data['Estimated'] = 'Yes' if has_extrapolated else 'No'
-        row_data['Flag'] = flag
-
-        analysis_data.append(row_data)
-
-        if has_extrapolated:
-            bold_cells.append((row_idx, f'VQ_{current_year}'))
-            bold_cells.append((row_idx, 'VQ_Change'))
-            bold_cells.append((row_idx, 'VQ_Change_%'))
-
-    def _create_monthly_comparison_rows(self, site_id, period, period_year, current_year,
-                                        site_data, month_order, feature_info,
-                                        analysis_data, bold_cells, row_idx):
-        """
-        Create 12 monthly rows + 1 TOTAL row.
-        Loops over all detected features dynamically — not just Turnover.
-        For each feature: always tries month-specific lookup first, then falls back.
-        """
-        historic_vq_total = 0
-        current_vq_total = 0
-
-        # Running totals/lists per feature for TOTAL row
-        # {feat: {'hist': [], 'curr': []}}
-        feature_monthly_totals = {feat: {'hist': [], 'curr': []} for feat in feature_info}
-
-        for month in month_order:
-            historic_vq = period.monthly_data.get(month)
-
-            month_data = site_data[site_data['Month'] == month]
-            if len(month_data) > 0:
-                current_vq = month_data['Volumetric Quantity'].iloc[0]
-                is_extrapolated = (month_data['Data integrity'].iloc[0] == 'Estimated'
-                                   if 'Data integrity' in month_data.columns else False)
-                estimation_method = (month_data['Estimation Method'].iloc[0]
-                                     if is_extrapolated and 'Estimation Method' in month_data.columns else '')
-                r2_score_val = (month_data['Data Quality Score'].iloc[0]
-                                if is_extrapolated and 'Data Quality Score' in month_data.columns else None)
-            else:
-                current_vq = None
-                is_extrapolated = False
-                estimation_method = ''
-                r2_score_val = None
-
-            vq_change = None
-            vq_change_pct = None
-            if historic_vq is not None and current_vq is not None:
-                vq_change = current_vq - historic_vq
-                vq_change_pct = (vq_change / historic_vq * 100) if historic_vq != 0 else None
-
-            if historic_vq is not None:
-                historic_vq_total += historic_vq
-            if current_vq is not None:
-                current_vq_total += current_vq
-
-            flag = None
-            if vq_change_pct is not None:
-                if abs(vq_change_pct) > 50:
-                    flag = 'Large change'
-                elif abs(vq_change_pct) < 10:
-                    flag = 'Normal'
-                else:
-                    flag = 'Moderate'
-
-            row_data = {
-                'Site': site_id,
-                'Month': month,
-                f'VQ_{period_year}': historic_vq,
-                f'VQ_{current_year}': current_vq,
-                'VQ_Change': vq_change,
-                'VQ_Change_%': round(vq_change_pct, 1) if vq_change_pct is not None else None,
-            }
-
-            # ── Dynamic feature columns ──────────────────────────────────
-            for feat, info in feature_info.items():
-                # Historic: always try month-specific first, then fallbacks
-                hist_val = period.get_monthly_feature(month, feat)
-                if hist_val is None:
-                    hist_val = period.features.get(feat)
-                if hist_val is None:
-                    hist_val = info['hist_annual']
-
-                # Current: get from this month's row
-                curr_val = None
-                if len(month_data) > 0 and feat in month_data.columns:
-                    v = month_data[feat].iloc[0]
+    def _load_historic_features(self):
+        print("  Loading historic features...")
+        try:
+            hf = (pd.read_csv(self.historic_features_file)
+                  if self.historic_features_file.lower().endswith('.csv')
+                  else pd.read_excel(self.historic_features_file))
+            hf.columns = hf.columns.str.strip()
+            scol = next((c for c in ['Site identifier', 'Site_identifier', 'Location']
+                         if c in hf.columns), None)
+            if not scol:
+                return
+            feat_cols = [c for c in hf.columns if c not in _META and c != scol]
+            for _, row in hf.iterrows():
+                site = row.get(scol)
+                if pd.isna(site):
+                    continue
+                site = str(site).strip()
+                self.historic_feats.setdefault(site, {})
+                for fc in feat_cols:
+                    v = row.get(fc)
                     if pd.notna(v):
-                        curr_val = float(v)
+                        try:
+                            self.historic_feats[site][fc] = float(v)
+                        except Exception:
+                            self.historic_feats[site][fc] = v
+            print(f"  Historic features: {len(self.historic_feats)} sites")
+        except Exception as e:
+            print(f"  ⚠  Historic features error: {e}")
 
-                change = None
-                change_pct = None
-                if hist_val is not None and curr_val is not None and float(hist_val) != 0:
-                    change = curr_val - float(hist_val)
-                    change_pct = round((change / float(hist_val)) * 100, 1)
+    # ── Seasonal ──────────────────────────────────────────────────────────────
 
-                row_data[f'{feat}_{period_year}'] = hist_val
-                row_data[f'{feat}_{current_year}'] = curr_val
-                row_data[f'{feat}_Change'] = change
-                row_data[f'{feat}_Change_%'] = change_pct
+    def _calc_seasonal(self):
+        """
+        Compute two levels of seasonal index:
+          self.seasonal_patterns        — cross-dataset (all sites, all months)
+          self.site_seasonal_patterns   — per-site where site has >=3 known months
 
-                if hist_val is not None:
-                    feature_monthly_totals[feat]['hist'].append(float(hist_val))
-                if curr_val is not None:
-                    feature_monthly_totals[feat]['curr'].append(curr_val)
+        Index meaning: Jan=1.06 means January is typically 6% above that site's average.
+        Applied at prediction time as: anchor × index[month].
+        """
+        mo = self.known[self.known['_Timeframe'] == 'Monthly']
+        if len(mo) < 4:
+            return
 
-            row_data['Estimation Method'] = estimation_method
-            row_data['Data Quality Score'] = r2_score_val
-            row_data['Estimated'] = 'Yes' if is_extrapolated else 'No'
-            row_data['Flag'] = flag
+        # Cross-dataset index
+        avgs = mo.groupby('_Month')[self.vq_col].mean()
+        overall = avgs.mean()
+        if overall > 0:
+            self.seasonal_patterns = {m: float(v / overall) for m, v in avgs.items()}
 
-            analysis_data.append(row_data)
+        # Per-site index (only for sites with >=3 months of data)
+        self.site_seasonal_patterns = {}
+        for site, grp in mo.groupby(self.site_col):
+            if grp['_Month'].nunique() < 3:
+                continue
+            site_avgs = grp.groupby('_Month')[self.vq_col].mean()
+            site_overall = site_avgs.mean()
+            if site_overall > 0:
+                self.site_seasonal_patterns[str(site).strip()] = {
+                    m: float(v / site_overall) for m, v in site_avgs.items()
+                }
 
-            if is_extrapolated and current_vq is not None:
-                bold_cells.append((row_idx, f'VQ_{current_year}'))
-                bold_cells.append((row_idx, 'VQ_Change'))
-                bold_cells.append((row_idx, 'VQ_Change_%'))
+        print(f"  Seasonal index: cross-dataset ({len(self.seasonal_patterns)} months), "
+              f"per-site ({len(self.site_seasonal_patterns)} sites)")
 
-            row_idx += 1
+    def _seasonal_factor(self, site, month):
+        """Return the best available seasonal factor for this site+month."""
+        if not month:
+            return 1.0
+        # Prefer site-specific index if available for this month
+        site_idx = self.site_seasonal_patterns.get(site, {})
+        if month in site_idx:
+            return site_idx[month]
+        # Fall back to cross-dataset
+        return self.seasonal_patterns.get(month, 1.0)
 
-        # ── TOTAL row ────────────────────────────────────────────────────────
-        total_vq_change = None
-        total_vq_change_pct = None
-        if historic_vq_total > 0 and current_vq_total > 0:
-            total_vq_change = current_vq_total - historic_vq_total
-            total_vq_change_pct = round((total_vq_change / historic_vq_total) * 100, 1)
+    def _sanity_bounds(self):
+        """
+        Compute dataset-wide VQ bounds for sanity-checking predictions.
+        Lower: 0 (never negative)
+        Upper: 3× the 99th percentile of all known VQ values
+        """
+        vq_vals = self.known[self.vq_col].dropna().values
+        if len(vq_vals) == 0:
+            return 0.0, float('inf')
+        p99 = float(np.percentile(vq_vals, 99))
+        return 0.0, p99 * 3.0
 
-        total_row = {
-            'Site': site_id,
-            'Month': 'TOTAL',
-            f'VQ_{period_year}': historic_vq_total if historic_vq_total > 0 else None,
-            f'VQ_{current_year}': current_vq_total if current_vq_total > 0 else None,
-            'VQ_Change': total_vq_change,
-            'VQ_Change_%': total_vq_change_pct,
-        }
+    def _clip(self, value, lo, hi):
+        """Clip a prediction to sanity bounds. Returns None if value is non-finite."""
+        if value is None or not np.isfinite(value):
+            return None
+        if value < lo:
+            return None   # negatives → reject, don't clip to 0 silently
+        return min(value, hi)
 
-        for feat, info in feature_info.items():
-            hist_vals = feature_monthly_totals[feat]['hist']
-            curr_vals = feature_monthly_totals[feat]['curr']
+    # ── Statistical tests ─────────────────────────────────────────────────────
 
-            # For TOTAL row: sum if monthly-varying, use annual if repeated
-            if info['hist_is_repeated']:
-                hist_total = info['hist_annual']
-            else:
-                hist_total = sum(hist_vals) if hist_vals else info['hist_annual']
+    def run_statistical_tests(self):
+        print("\n" + "=" * 60)
+        print("STATISTICAL ANALYSIS")
+        print("=" * 60)
+        self._calc_seasonal()
+        mn = self.known[self.known['_Timeframe'] == 'Monthly']
+        an = self.known[self.known['_Timeframe'] == 'Annual']
 
-            if info['curr_is_repeated']:
-                curr_total = info['curr_annual']
-            else:
-                curr_total = sum(curr_vals) if curr_vals else info['curr_annual']
+        # 1 – Site average (monthly)
+        if len(mn) >= 4:
+            sa = mn.groupby(self.site_col)[self.vq_col].mean()
+            preds = mn[self.site_col].map(sa).fillna(sa.mean()).values.astype(float)
+            acts  = mn[self.vq_col].values.astype(float)
+            pr, pr2, pp = _pearson(preds, acts)
+            sr, sr2, sp = _spearman(preds, acts)
+            kr, kr2, kp = _kendall(preds, acts)
+            eff = _eff_r2(pr2, sr2, kr2)
+            self._reg('Site_Average',
+                      'Site average VQ across all known monthly rows',
+                      f'{len(mn)} monthly rows',
+                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                      _site_avgs=sa.to_dict())
 
-            total_change = None
-            total_change_pct = None
-            if hist_total is not None and curr_total is not None and float(hist_total) != 0:
-                total_change = curr_total - float(hist_total)
-                total_change_pct = round((total_change / float(hist_total)) * 100, 1)
+        # 2 – Site average x seasonal
+        if len(mn) >= 4 and self.seasonal_patterns:
+            sa2  = mn.groupby(self.site_col)[self.vq_col].mean().to_dict()
+            fall = mn[self.vq_col].mean()
+            preds2 = []
+            for _, row in mn.iterrows():
+                avg = sa2.get(row[self.site_col], fall)
+                sf  = self.seasonal_patterns.get(row['_Month'], 1.0)
+                preds2.append(avg * sf)
+            p2 = np.array(preds2, float)
+            a2 = mn[self.vq_col].values.astype(float)
+            pr, pr2, pp = _pearson(p2, a2)
+            sr, sr2, sp = _spearman(p2, a2)
+            kr, kr2, kp = _kendall(p2, a2)
+            eff = _eff_r2(pr2, sr2, kr2)
+            self._reg('Site_Average_Seasonal',
+                      'Site average VQ scaled by monthly seasonal factor',
+                      f'{len(mn)} monthly rows',
+                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                      _site_avgs=sa2, _seasonal=True)
 
-            total_row[f'{feat}_{period_year}'] = hist_total
-            total_row[f'{feat}_{current_year}'] = curr_total
-            total_row[f'{feat}_Change'] = total_change
-            total_row[f'{feat}_Change_%'] = total_change_pct
+        # 3 – Cross-site seasonal average
+        if len(mn) >= 4 and self.seasonal_patterns:
+            ma   = mn.groupby('_Month')[self.vq_col].mean().to_dict()
+            preds3 = [ma.get(row['_Month']) for _, row in mn.iterrows()]
+            p3 = np.array([v for v in preds3 if v is not None], float)
+            a3 = mn[self.vq_col].values[:len(p3)].astype(float)
+            pr, pr2, pp = _pearson(p3, a3)
+            sr, sr2, sp = _spearman(p3, a3)
+            kr, kr2, kp = _kendall(p3, a3)
+            eff = _eff_r2(pr2, sr2, kr2)
+            self._reg('Seasonal_Average',
+                      'Cross-site mean VQ per calendar month',
+                      f'{len(mn)} monthly rows',
+                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                      _month_avgs=ma)
 
-        total_row['Estimation Method'] = ''
-        total_row['Data Quality Score'] = None
-        total_row['Estimated'] = ''
-        total_row['Flag'] = ''
-
-        analysis_data.append(total_row)
-        row_idx += 1
-
-        return row_idx
-
-    def _format_monthly_availability(self, months, month_count):
-        """Format monthly data availability description."""
-        if month_count == 12:
-            return "Full"
-        elif month_count == 1:
-            if not months or len(months) == 0:
-                return "Annual"
-            elif len(months) == 1:
-                return months[0][:3]
-        elif month_count == 0:
-            return "None"
-
-        if not months or len(months) == 0:
-            return f"{month_count} months"
-
-        month_order = ['January', 'February', 'March', 'April', 'May', 'June',
-                       'July', 'August', 'September', 'October', 'November', 'December']
-        month_abbr = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-        month_indices = []
-        for m in months:
-            if m in month_order:
-                month_indices.append(month_order.index(m))
-
-        month_indices = sorted(set(month_indices))
-
-        if len(month_indices) == 0:
-            return f"{month_count} months"
-
-        is_consecutive = True
-        for i in range(len(month_indices) - 1):
-            if month_indices[i + 1] - month_indices[i] != 1:
-                is_consecutive = False
+        # 4 – Overall average fallback
+        for sub, lbl in [(self.known, 'all'), (an, 'annual')]:
+            if len(sub) >= 4:
+                avg = float(sub[self.vq_col].mean())
+                self._reg(f'Overall_Average_{lbl}',
+                          f'Overall mean of {lbl} VQ values',
+                          f'{len(sub)} rows',
+                          None, None, None, None, None, None, None, None, None, None,
+                          None, None, None, 0.0,
+                          _avg=avg)
                 break
 
-        if is_consecutive and len(month_indices) >= 2:
-            start_month = month_abbr[month_indices[0]]
-            end_month = month_abbr[month_indices[-1]]
-            return f"{start_month}-{end_month}"
-        else:
-            month_names = [month_abbr[i] for i in month_indices]
-            if len(month_names) <= 4:
-                return ', '.join(month_names)
+        # 5 – Numeric feature intensity
+        for feat in self.numeric_features:
+            pool = self.known[self.known[feat].notna()]
+            if len(pool) < 4:
+                continue
+            vq = pool[self.vq_col].values.astype(float)
+            fv = pool[feat].values.astype(float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratios = np.where(fv > 0, vq / fv, np.nan)
+            slope = float(np.nanmedian(ratios)) if np.any(np.isfinite(ratios)) else None
+            pr, pr2, pp = _pearson(fv, vq)
+            sr, sr2, sp = _spearman(fv, vq)
+            kr, kr2, kp = _kendall(fv, vq)
+            eff = _eff_r2(pr2, sr2, kr2)
+            self._reg(f'Intensity_{feat}',
+                      f'VQ proportional to {feat} (median intensity slope)',
+                      f'{len(pool)} rows with {feat} + VQ',
+                      slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                      _feat=feat, _mtype='Feature_Intensity')
+
+            pm = pool[pool['_Timeframe'] == 'Monthly']
+            if len(pm) >= 4 and self.seasonal_patterns and slope:
+                preds_s, acts_s = [], []
+                for _, row in pm.iterrows():
+                    sf = self.seasonal_patterns.get(row['_Month'], 1.0)
+                    preds_s.append(float(row[feat]) * slope * sf)
+                    acts_s.append(row[self.vq_col])
+                if len(preds_s) >= 4:
+                    ps  = np.array(preds_s, float)
+                    as_ = np.array(acts_s, float)
+                    pr, pr2, pp = _pearson(ps, as_)
+                    sr, sr2, sp = _spearman(ps, as_)
+                    kr, kr2, kp = _kendall(ps, as_)
+                    eff = _eff_r2(pr2, sr2, kr2)
+                    self._reg(f'Intensity_{feat}_Seasonal',
+                              f'VQ ~ {feat} intensity x seasonal factor',
+                              f'{len(preds_s)} monthly rows with {feat}',
+                              slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                              _feat=feat, _mtype='Feature_Intensity_Seasonal', _seasonal=True)
+
+        # 6 – Categorical features (point-biserial)
+        for feat in self.categorical_features:
+            pool = self.known[self.known[feat].notna()]
+            if len(pool) < 4:
+                continue
+            vq    = pool[self.vq_col].values.astype(float)
+            codes = pd.Categorical(pool[feat]).codes.astype(float)
+            pbr, pbr2, pbp = _pointbiserial(codes, vq)
+            eff = _eff_r2(None, None, pbr2=pbr2)
+            cat_means = pool.groupby(feat)[self.vq_col].mean().to_dict()
+            self._reg(f'Categorical_{feat}',
+                      f'Group mean VQ by {feat}',
+                      f'{len(pool)} rows grouped by {feat}',
+                      None, None, None, None, None, None, None, None, None, None,
+                      pbr, pbr2, pbp, eff,
+                      _feat=feat, _mtype='Categorical', _cat_means=cat_means)
+
+        # 7 – Historic-adjusted
+        if self.historic_vq:
+            for feat in self.numeric_features:
+                preds_h, acts_h = [], []
+                for _, row in mn.iterrows():
+                    site  = str(row.get(self.site_col, '')).strip()
+                    month = row['_Month']
+                    cf    = row.get(feat)
+                    if pd.isna(cf) or not month:
+                        continue
+                    ckey = self._composite_key(row)
+                    hvq = self.historic_vq.get(ckey, {}).get(month)
+                    if hvq is None:
+                        ha = self.historic_vq.get(ckey, {}).get('ANNUAL')
+                        if ha:
+                            hvq = (ha/12) * self.seasonal_patterns.get(month, 1.0)
+                    if hvq is None:
+                        continue
+                    hf = self.historic_feats.get(site, {}).get(feat)
+                    if hf and float(hf) != 0:
+                        preds_h.append(hvq * (float(cf)/float(hf)))
+                        acts_h.append(row[self.vq_col])
+                if len(preds_h) >= 4:
+                    ph = np.array(preds_h, float)
+                    ah = np.array(acts_h, float)
+                    pr, pr2, pp = _pearson(ph, ah)
+                    sr, sr2, sp = _spearman(ph, ah)
+                    kr, kr2, kp = _kendall(ph, ah)
+                    eff = _eff_r2(pr2, sr2, kr2)
+                    self._reg(f'Historic_Adjusted_{feat}',
+                              f'Historic VQ x (current {feat} / historic {feat})',
+                              f'{len(preds_h)} rows with historic VQ + {feat}',
+                              None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                              _feat=feat, _mtype='Historic_Adjusted')
+
+            # Last-year direct
+            pl, al = [], []
+            for _, row in mn.iterrows():
+                month = row['_Month']
+                ckey  = self._composite_key(row)
+                hvq   = self.historic_vq.get(ckey, {}).get(month)
+                if hvq is not None:
+                    pl.append(hvq)
+                    al.append(row[self.vq_col])
+            if len(pl) >= 4:
+                pla = np.array(pl, float)
+                ala = np.array(al, float)
+                pr, pr2, pp = _pearson(pla, ala)
+                sr, sr2, sp = _spearman(pla, ala)
+                kr, kr2, kp = _kendall(pla, ala)
+                eff = _eff_r2(pr2, sr2, kr2)
+                self._reg('Historic_LastYear_Direct',
+                          'Same calendar month value from previous year',
+                          f'{len(pl)} monthly rows with historic monthly VQ',
+                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                          _mtype='Historic_Direct')
+
+        print(f"  {len(self.stat_methods)} stat/rule methods registered")
+
+    def _reg(self, name, desc, input_data, slope,
+             pr, pr2, pp, sr, sr2, sp, kr, kr2, kp,
+             pbr, pbr2, pbp, eff, **kw):
+        self.stat_methods[name] = dict(
+            description=desc, input_data=input_data, slope=slope,
+            pearson_r=pr, pearson_r2=pr2, pearson_p=pp,
+            spearman_r=sr, spearman_r2=sr2, spearman_p=sp,
+            kendall_tau=kr, kendall_r2=kr2, kendall_p=kp,
+            pointbiserial_r=pbr, pointbiserial_r2=pbr2, pointbiserial_p=pbp,
+            effective_r2=eff, predictions_made=0, **kw
+        )
+
+    # ── ML models ─────────────────────────────────────────────────────────────
+
+    def train_ml_models(self):
+        print("\n" + "=" * 60)
+        print("MACHINE LEARNING MODELS")
+        print("=" * 60)
+        mn    = self.known[self.known['_Timeframe'] == 'Monthly']
+        all_k = self.known
+
+        data_sources = []
+        data_sources.append(f'Input file ({len(self.known)} known rows)')
+        if self.historic_vq:
+            data_sources.append(f'Historic records ({len(self.historic_vq)} sites)')
+        if self.historic_feats:
+            data_sources.append(f'Historic features ({len(self.historic_feats)} sites)')
+        self._data_sources_label = ' + '.join(data_sources)
+
+        if len(mn) >= 6:
+            self._train_subset(mn, ['_Month'] + self.numeric_features,
+                               'Monthly', self.categorical_features)
+        if len(all_k) >= 6:
+            self._train_subset(all_k, self.numeric_features,
+                               'All', self.categorical_features)
+        for cat in self.categorical_features:
+            sub = self.known[self.known[cat].notna()]
+            if len(sub) >= 6:
+                self._train_subset(sub, ['_Month'] + self.numeric_features,
+                                   f'By_{cat}', [cat] + self.categorical_features)
+        print(f"  {len(self.ml_models)} ML models trained")
+
+    def _train_subset(self, df_sub, feat_cols, prefix, cat_cols=None):
+        cat_cols = cat_cols or []
+        encoders = {}
+        valid = []
+        for fc in feat_cols:
+            if fc == '_Month' and '_Month' in df_sub.columns:
+                enc = LabelEncoder()
+                enc.fit(df_sub['_Month'].fillna('Unknown'))
+                encoders['_Month'] = enc
+                valid.append('_Month')
+            elif fc in cat_cols and fc in df_sub.columns:
+                enc = LabelEncoder()
+                enc.fit(df_sub[fc].fillna('Unknown').astype(str))
+                encoders[fc] = enc
+                valid.append(fc)
+            elif (fc in df_sub.columns
+                  and pd.api.types.is_numeric_dtype(df_sub[fc])
+                  and df_sub[fc].notna().mean() >= 0.2):
+                valid.append(fc)
+
+        if not valid:
+            return
+
+        rows_ok = df_sub.copy()
+        for fc in valid:
+            if fc not in encoders:
+                rows_ok = rows_ok[rows_ok[fc].notna()]
+        rows_ok = rows_ok[rows_ok[self.vq_col].notna()]
+        if len(rows_ok) < 6:
+            return
+
+        X_parts = []
+        for fc in valid:
+            if fc in encoders:
+                vals = rows_ok[fc].fillna('Unknown').astype(str)
+                try:
+                    enc = encoders[fc]
+                    X_parts.append(enc.transform(vals).reshape(-1, 1))
+                except Exception:
+                    enc2 = LabelEncoder()
+                    enc2.fit(vals)
+                    encoders[fc] = enc2
+                    X_parts.append(enc2.transform(vals).reshape(-1, 1))
             else:
-                return f"{', '.join(month_names[:3])}, ... ({len(month_names)} months)"
+                med = rows_ok[fc].median()
+                X_parts.append(rows_ok[fc].fillna(med).values.reshape(-1, 1))
 
-    def run_extrapolation(self):
-        """Main method to run the complete extrapolation process"""
-        print("=" * 70)
-        print("VOLUMETRIC DATA EXTRAPOLATION TOOL WITH HISTORIC DATA")
-        print("=" * 70)
+        X = np.hstack(X_parts).astype(float)
+        y = rows_ok[self.vq_col].values.astype(float)
+        feat_label = ', '.join(
+            fc.replace('_Month', 'Month').replace('_', ' ').strip() for fc in valid)
 
-        print("\n1. Loading data...")
-        self.load_data()
+        for mname, mobj in [
+            ('Linear_Regression', LinearRegression()),
+            ('Polynomial_Regression', make_pipeline(PolynomialFeatures(2), LinearRegression())),
+            ('Random_Forest',
+             RandomForestRegressor(n_estimators=100, random_state=42, max_depth=10, n_jobs=-1)),
+            ('Gradient_Boosting',
+             GradientBoostingRegressor(n_estimators=100, random_state=42, max_depth=5)),
+        ]:
+            key = f'{prefix}_{mname}'
+            r2, n_train, n_test, n_folds, cv_type = _cv_r2_with_meta(mobj, X, y)
+            try:
+                mobj.fit(X, y)
+            except Exception:
+                continue
+            self.ml_models[key] = dict(
+                model=mobj, features=valid, encoders=encoders,
+                r2=float(r2), type=mname.replace('_', ' '),
+                description=f'{mname.replace("_"," ")} using {feat_label}. CV R2={r2:.3f} (n={n_train})',
+                n_train=n_train,
+                n_test_per_fold=n_test,
+                n_folds=n_folds,
+                cv_type=cv_type,
+                data_sources=getattr(self, '_data_sources_label', ''),
+                predictions_made=0,
+            )
+            print(f"  {'✓' if r2>=0.3 else '~'} {key}: R2={r2:.4f} "
+                  f"[train={n_train}, test/fold={n_test}, {cv_type}]")
 
-        print("\n2. Determining timeframes...")
-        self.add_timeframe_columns()
+    # ── Prediction ────────────────────────────────────────────────────────────
 
-        print("\n3. Loading historic data...")
-        self.load_historic_data()
+    def predict_row(self, row):
+        """
+        Two-stage waterfall:
 
-        print("\n4. Engineering features from historic data...")
-        self.engineer_historic_features()
+        STAGE 1 — site anchor (the VQ level):
+          Tier 1: Site has own actuals          → site mean VQ
+          Tier 2: Site has historic data         → historic monthly VQ (adj for feature change)
+          Tier 3: No data for this site          → categorical group mean, then ML level,
+                                                   then feature intensity, then cross-site avg
 
-        print("\n5. Identifying blank rows...")
-        self.identify_blank_rows()
+        STAGE 2 — seasonal index applied to anchor:
+          Per-site index if site has ≥3 known months, else cross-dataset.
+          Always applied so no two months ever get the same flat value.
 
-        print("\n6. Classifying features...")
-        self.classify_features()
+        Sanity: clip to [0, 3×p99]. Reject negatives.
+        """
+        site  = str(row.get(self.site_col, '')).strip()
+        month = row.get('_Month', '')
+        tf    = row.get('_Timeframe', '')
+        lo, hi = self._vq_lo, self._vq_hi
 
-        print("\n7. Calculating seasonal patterns...")
-        self.calculate_seasonal_patterns()
+        # Composite key: (site, ghg_category [, ghg_sub_category])
+        ckey = self._composite_key(row)
 
-        print("\n8. Training models...")
-        self.train_models()
+        anchor        = None
+        anchor_method = None
+        anchor_r2     = 0.0
 
-        print("\n9. Extrapolating blank rows...")
-        results = self.extrapolate_blank_rows()
+        # ── Tier 1: this site+category has own actuals in current file ────────
+        site_known = self.known[
+            self.known[self.site_col].astype(str).str.strip() == site]
+        # If GHG column exists, further filter to this category
+        if self.ghg_col and len(site_known) > 0:
+            ghg_val = row.get(self.ghg_col)
+            if pd.notna(ghg_val):
+                site_known = site_known[
+                    site_known[self.ghg_col].astype(str).str.strip() == str(ghg_val).strip()]
+            if self.ghg_sub_col:
+                ghg_sub_val = row.get(self.ghg_sub_col)
+                if pd.notna(ghg_sub_val) and len(site_known) > 0:
+                    site_known = site_known[
+                        site_known[self.ghg_sub_col].astype(str).str.strip() == str(ghg_sub_val).strip()]
 
-        print("\n10. Creating output dataframe...")
-        output_df = self.create_output_dataframe(results)
+        if len(site_known) > 0:
+            anchor        = float(site_known[self.vq_col].mean())
+            anchor_method = 'Site_Average_Seasonal'
+            anchor_r2     = self.stat_methods.get('Site_Average_Seasonal',
+                            self.stat_methods.get('Site_Average', {})
+                            ).get('effective_r2', 0.6)
 
-        print(f"\n{'=' * 70}")
-        print(f"EXTRAPOLATION COMPLETE")
-        print(f"{'=' * 70}")
-        print(f"Total rows: {len(output_df)}")
-        print(f"Extrapolated rows: {len(results)}")
-        if results:
-            print(f"Average quality score: {np.mean([r['r2'] for r in results]):.3f}")
+        # ── Tier 2: historic data for this site+category ──────────────────────
+        elif ckey in self.historic_vq:
+            hist = self.historic_vq[ckey]
+            hval = hist.get(month)
+            specific_month = hval is not None
+            if hval is None and 'ANNUAL' in hist:
+                hval = hist['ANNUAL'] / 12.0
 
-        model_testing_matrix = self.create_model_testing_matrix()
-        model_performance = self.create_model_performance_sheet()
-        data_availability = self.create_data_availability_sheet()
-        historic_analysis = self.create_historic_analysis_sheet(output_df)
-        training_data = self.create_training_data_sheet()
+            if hval is not None:
+                # Apply multi-year growth rate projection if available
+                # e.g. historic is 2023 data, current year is 2025 → apply rate^2
+                growth = self.historic_growth_rates.get(ckey)
+                if growth and self.historic_year and self.current_year:
+                    years_forward = self.current_year - self.historic_year
+                    if years_forward > 0:
+                        hval = hval * (growth ** years_forward)
+                        anchor_method = 'Historic_GrowthProjected'
+                    else:
+                        anchor_method = 'Historic_Direct'
+                else:
+                    anchor_method = 'Historic_Direct'
 
-        return output_df, results, model_testing_matrix, model_performance, data_availability, historic_analysis, training_data
+                anchor   = float(hval)
+                anchor_r2 = self.stat_methods.get('Historic_LastYear_Direct',
+                            {}).get('effective_r2', 0.35)
 
-    @staticmethod
-    def apply_bold_formatting_to_sheet(writer, sheet_name, dataframe):
-        """Apply bold formatting to cells marked as extrapolated in the historic analysis sheet."""
+                # Try feature-based adjustment on top of the anchor
+                best_adj_r2 = 0.0
+                for feat in self.numeric_features:
+                    cf = row.get(feat)
+                    hf = self.historic_feats.get(site, {}).get(feat)
+                    if pd.isna(cf) or hf is None or float(hf) == 0:
+                        continue
+                    ratio = float(cf) / float(hf)
+                    if not (0.1 <= ratio <= 10.0):
+                        continue
+                    adj_r2 = self.stat_methods.get(
+                        f'Historic_Adjusted_{feat}', {}).get('effective_r2', 0.0)
+                    if adj_r2 > best_adj_r2:
+                        anchor        = float(hval) * ratio
+                        anchor_method = f'Historic_Adjusted_{feat}'
+                        anchor_r2     = adj_r2
+                        best_adj_r2   = adj_r2
+
+                # Specific monthly historic → apply seasonal once and return
+                if specific_month and anchor_method in ('Historic_Direct', 'Historic_GrowthProjected'):
+                    sf   = self._seasonal_factor(site, month)
+                    pred = self._clip(anchor * sf, lo, hi)
+                    return (pred if pred is not None
+                            else float(self.known[self.vq_col].mean()),
+                            anchor_method, anchor_r2)
+
+        # ── Tier 3: no actuals, no (trusted) historic — derive from features ──
+        # Runs when: site has no current actuals AND (no historic, OR historic is poor quality)
+        if anchor is None:
+            # 3a: categorical group mean
+            for feat in self.categorical_features:
+                cv   = row.get(feat)
+                info = self.stat_methods.get(f'Categorical_{feat}', {})
+                cm   = info.get('_cat_means', {})
+                if pd.isna(cv) or cv not in cm:
+                    continue
+                r2 = info.get('effective_r2', 0.0)
+                if r2 > anchor_r2:
+                    anchor        = float(cm[cv])
+                    anchor_method = f'Categorical_{feat}'
+                    anchor_r2     = r2
+
+            # 3b: ML models (neutral month → level only)
+            for name, info in self.ml_models.items():
+                if tf == 'Annual' and '_Month' in info['features']:
+                    continue
+                pred = self._apply_ml_level(info, row)
+                if pred is None:
+                    continue
+                r2 = info['r2']
+                # nan R² (too few rows for CV) — treat as 0 for comparison,
+                # still better than no prediction at all
+                if r2 is None or (isinstance(r2, float) and np.isnan(r2)):
+                    r2 = 0.0
+                if r2 > anchor_r2:
+                    anchor        = pred
+                    anchor_method = name
+                    anchor_r2     = r2
+
+            # 3c: feature intensity slope
+            for feat in self.numeric_features:
+                info  = self.stat_methods.get(f'Intensity_{feat}', {})
+                slope = info.get('slope')
+                fval  = row.get(feat)
+                if slope is None or pd.isna(fval):
+                    continue
+                r2 = info.get('effective_r2', 0.0)
+                if r2 > anchor_r2:
+                    anchor        = float(fval) * slope
+                    anchor_method = f'Intensity_{feat}'
+                    anchor_r2     = r2
+
+            # 3d: cross-site seasonal average (already shaped — return directly)
+            if anchor is None:
+                ma = self.stat_methods.get('Seasonal_Average', {}).get('_month_avgs', {})
+                v  = ma.get(month) if month else None
+                if v is not None:
+                    pred = self._clip(float(v), lo, hi)
+                    r2   = self.stat_methods.get('Seasonal_Average', {}).get('effective_r2', 0.0)
+                    return (pred if pred is not None
+                            else float(self.known[self.vq_col].mean()),
+                            'Seasonal_Average', r2)
+
+            if anchor is None:
+                return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+
+        # ── Stage 2: apply seasonal index to anchor ───────────────────────────
+        sf         = self._seasonal_factor(site, month) if month else 1.0
+        prediction = self._clip(anchor * sf, lo, hi)
+
+        if prediction is None:
+            return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+
+        return prediction, anchor_method, anchor_r2
+
+    def _apply_ml_level(self, info, row):
+        """Apply ML model with a neutral month encoding to get site-level VQ (no seasonal bias)."""
+        X_parts = []
+        for fc in info['features']:
+            if fc == '_Month':
+                enc = info['encoders'].get('_Month')
+                mid = float(len(enc.classes_) - 1) / 2.0 if enc else 6.0
+                X_parts.append([[mid]])
+            elif fc in info['encoders']:
+                val = str(row.get(fc, 'Unknown'))
+                enc = info['encoders'][fc]
+                try:
+                    X_parts.append([[enc.transform([val])[0]]])
+                except Exception:
+                    X_parts.append([[0]])
+            else:
+                val = row.get(fc)
+                if pd.isna(val):
+                    return None
+                X_parts.append([[float(val)]])
+        if not X_parts:
+            return None
+        X = np.hstack([np.array(p) for p in X_parts]).astype(float)
         try:
-            from openpyxl.styles import Font
+            return float(info['model'].predict(X)[0])
+        except Exception:
+            return None
 
-            if not hasattr(dataframe, '_bold_cells') or not dataframe._bold_cells:
-                return
+    def _apply_ml(self, info, row):
+        """Legacy direct ML apply — not used in main waterfall."""
+        X_parts = []
+        for fc in info['features']:
+            if fc in info['encoders']:
+                val = str(row.get(fc, 'Unknown'))
+                enc = info['encoders'][fc]
+                try:
+                    X_parts.append([[enc.transform([val])[0]]])
+                except Exception:
+                    X_parts.append([[0]])
+            else:
+                val = row.get(fc)
+                if pd.isna(val):
+                    return None
+                X_parts.append([[float(val)]])
+        if not X_parts:
+            return None
+        X = np.hstack([np.array(p) for p in X_parts]).astype(float)
+        try:
+            return float(info['model'].predict(X)[0])
+        except Exception:
+            return None
 
-            workbook = writer.book
-            worksheet = writer.sheets[sheet_name]
+    # ── Fill blanks ───────────────────────────────────────────────────────────
 
-            bold_font = Font(bold=True)
+    def fill_blanks(self):
+        print("\n" + "=" * 60)
+        print("FILLING MISSING VALUES")
+        print("=" * 60)
 
-            for row_idx, col_name in dataframe._bold_cells:
-                if col_name in dataframe.columns:
-                    col_idx = dataframe.columns.get_loc(col_name)
-                    excel_row = row_idx + 2
-                    excel_col = col_idx + 1
+        # Compute sanity bounds once before predicting
+        self._vq_lo, self._vq_hi = self._sanity_bounds()
+        print(f"  Sanity bounds: [{self._vq_lo:.2f}, {self._vq_hi:.2f}]")
 
-                    cell = worksheet.cell(row=excel_row, column=excel_col)
-                    cell.font = bold_font
-        except ImportError:
-            pass
-        except Exception as e:
-            print(f"⚠️  Could not apply bold formatting: {e}")
+        # Build categorical breakdown table for output
+        self._build_cat_breakdown()
+
+        results = []
+        for idx, row in self.blank.iterrows():
+            pred, method, r2 = self.predict_row(row)
+            results.append(dict(index=idx, prediction=pred, method=method, r2=r2))
+            if method in self.stat_methods:
+                self.stat_methods[method]['predictions_made'] += 1
+            elif method in self.ml_models:
+                self.ml_models[method]['predictions_made'] += 1
+        print(f"  Filled {len(results)} rows")
+        if results:
+            print(f"  Avg R2: {np.mean([r['r2'] for r in results]):.4f}")
+        return results
+
+    def _build_cat_breakdown(self):
+        """
+        For each categorical feature, compute per-category VQ stats
+        (mean, count, and seasonal means per month) for output sheet.
+        """
+        mn = self.known[self.known['_Timeframe'] == 'Monthly']
+        for feat in self.categorical_features:
+            pool = self.known[self.known[feat].notna()]
+            if len(pool) < 4:
+                continue
+            breakdown = {}
+            for cat_val, grp in pool.groupby(feat):
+                vq_vals = grp[self.vq_col].dropna()
+                if len(vq_vals) == 0:
+                    continue
+                cat_mean = float(vq_vals.mean())
+                # Per-month means for this category
+                monthly_grp = mn[mn[feat] == cat_val]
+                month_means = {}
+                if len(monthly_grp) >= 2:
+                    for mo, mg in monthly_grp.groupby('_Month'):
+                        if len(mg) >= 1:
+                            month_means[mo] = round(float(mg[self.vq_col].mean()), 2)
+                breakdown[str(cat_val)] = {
+                    'n_rows': int(len(vq_vals)),
+                    'n_sites': int(grp[self.site_col].nunique()),
+                    'mean_vq': round(cat_mean, 2),
+                    'min_vq':  round(float(vq_vals.min()), 2),
+                    'max_vq':  round(float(vq_vals.max()), 2),
+                    'month_means': month_means,
+                }
+            self.cat_breakdown[feat] = breakdown
+
+    # ── Output sheets ─────────────────────────────────────────────────────────
+
+    def build_output(self, results):
+        out = self.df.copy()
+
+        # Ensure these three columns exist — they may already be present in the input
+        if 'Data integrity' not in out.columns:
+            out['Data integrity'] = 'Actual'
+        else:
+            out['Data integrity'] = out['Data integrity'].fillna('Actual')
+
+        if 'Estimation Method' not in out.columns:
+            out['Estimation Method'] = ''
+
+        if 'Data Quality Score' not in out.columns:
+            out['Data Quality Score'] = np.nan
+
+        for r in results:
+            i = r['index']
+            out.at[i, self.vq_col]          = r['prediction']
+            out.at[i, 'Data integrity']     = 'Estimated'
+            out.at[i, 'Estimation Method']  = r['method']
+            out.at[i, 'Data Quality Score'] = round(r['r2'], 4)
+
+        out.drop(columns=['_Timeframe', '_Month'], errors='ignore', inplace=True)
+
+        # Reorder columns: put the three extrapolation result columns immediately
+        # after Volumetric Quantity, then everything else in original order
+        cols = list(out.columns)
+        result_cols = ['Data integrity', 'Estimation Method', 'Data Quality Score']
+        base_cols   = [c for c in cols if c not in result_cols]
+        vq_idx      = base_cols.index(self.vq_col) if self.vq_col in base_cols else len(base_cols)
+        ordered     = base_cols[:vq_idx+1] + result_cols + base_cols[vq_idx+1:]
+        out         = out[[c for c in ordered if c in out.columns]]
+
+        avail   = self._sheet_availability()
+        stat    = self._sheet_stat()
+        ml      = self._sheet_ml()
+        cat_bkd = self._sheet_cat_breakdown()
+        yoy     = self._sheet_yoy(out) if self.historic_vq else None
+        return out, avail, stat, ml, cat_bkd, yoy
+
+    def _sheet_availability(self):
+        rows = []
+        for idx, row in self.df.iterrows():
+            month = row.get('_Month', '')
+            site  = str(row.get(self.site_col, '')).strip()
+            entry = {
+                'Site Identifier': site,
+                'Month': month,
+                self.vq_col: row.get(self.vq_col),
+                'Data integrity': 'Actual' if pd.notna(row.get(self.vq_col)) else 'Missing',
+            }
+            for f in self.numeric_features:
+                v = row.get(f)
+                entry[f] = v if pd.notna(v) else ''
+            for f in self.categorical_features:
+                v = row.get(f)
+                entry[f] = v if pd.notna(v) else ''
+            if self.historic_vq:
+                ckey = self._composite_key(row)
+                hvq = (self.historic_vq.get(ckey, {}).get(month)
+                       or self.historic_vq.get(ckey, {}).get('ANNUAL', ''))
+                entry['Historic Volumetric Quantity'] = hvq
+                for f in self.numeric_features:
+                    entry[f'Historic {f}'] = self.historic_feats.get(site, {}).get(f, '')
+            rows.append(entry)
+        df = pd.DataFrame(rows)
+        return df.loc[:, (df != '').any(axis=0)]
+
+    def _sheet_stat(self):
+        rows = []
+        for name, info in self.stat_methods.items():
+            rows.append({
+                'Method': name,
+                'Description': info['description'],
+                'Input Data': info['input_data'],
+                'Intensity_Slope': info.get('slope'),
+                'Pearson_r': info.get('pearson_r'),
+                'Pearson_R2': info.get('pearson_r2'),
+                'Pearson_p': info.get('pearson_p'),
+                'Spearman_r': info.get('spearman_r'),
+                'Spearman_R2': info.get('spearman_r2'),
+                'Spearman_p': info.get('spearman_p'),
+                'Kendall_tau': info.get('kendall_tau'),
+                'Kendall_R2': info.get('kendall_r2'),
+                'Kendall_p': info.get('kendall_p'),
+                'PointBiserial_r': info.get('pointbiserial_r'),
+                'PointBiserial_R2': info.get('pointbiserial_r2'),
+                'PointBiserial_p': info.get('pointbiserial_p'),
+                'Effective_R2': round(info['effective_r2'], 4),
+                'Used_In_Prediction': 'Yes' if info['predictions_made'] > 0 else 'No',
+                'Predictions_Made': info['predictions_made'],
+            })
+        df = pd.DataFrame(rows)
+        if len(df):
+            df = df.sort_values('Effective_R2', ascending=False).reset_index(drop=True)
+        return df
+
+    def _sheet_ml(self):
+        rows = []
+        for name, info in self.ml_models.items():
+            feats = ', '.join(
+                fc.replace('_Month', 'Month').replace('_', ' ').strip()
+                for fc in info['features'])
+            n_train      = info.get('n_train', '')
+            n_test       = info.get('n_test_per_fold', '')
+            n_folds      = info.get('n_folds', '')
+            cv_type      = info.get('cv_type', '')
+            data_sources = info.get('data_sources', '')
+            n_features   = len(info['features'])
+            r2_raw       = info['r2']
+
+            # nan R² happens with LeaveOneOut on very small datasets —
+            # R² is undefined when there's only 1 test point per fold
+            if r2_raw is None or (isinstance(r2_raw, float) and np.isnan(r2_raw)):
+                cv_r2_display = None
+                reliability   = 'R² undefined — only 1 test point per fold (n too small for CV)'
+            elif r2_raw < 0:
+                cv_r2_display = round(r2_raw, 4)
+                reliability   = 'Negative R² — model worse than predicting the mean (overfitting)'
+            elif r2_raw < 0.1:
+                cv_r2_display = round(r2_raw, 4)
+                reliability   = 'Very weak — little predictive signal in these features'
+            elif r2_raw < 0.3:
+                cv_r2_display = round(r2_raw, 4)
+                reliability   = 'Weak — used only when no better method available'
+            elif r2_raw < 0.6:
+                cv_r2_display = round(r2_raw, 4)
+                reliability   = 'Moderate'
+            else:
+                cv_r2_display = round(r2_raw, 4)
+                reliability   = 'Good'
+
+            rows.append({
+                'Model': name,
+                'Type': info['type'],
+                'CV_R2': cv_r2_display,
+                'Reliability': reliability,
+                'Features_Used': feats,
+                'N_Features': n_features,
+                'N_Train_Rows': n_train,
+                'N_Test_Rows_Per_Fold': n_test,
+                'N_Folds': n_folds,
+                'CV_Method': cv_type,
+                'Data_Sources': data_sources,
+                'Description': info['description'],
+                'Predictions_Made': info['predictions_made'],
+            })
+        if not rows:
+            return pd.DataFrame()
+        # Sort: non-null R² descending first, then null ones at bottom
+        df = pd.DataFrame(rows)
+        df['_sort'] = df['CV_R2'].fillna(-999)
+        df = df.sort_values('_sort', ascending=False).drop(columns='_sort').reset_index(drop=True)
+        return df
+
+    def _sheet_yoy(self, out):
+        hy = self.historic_year or 'Prev'
+        cy = self.current_year  or 'Current'
+        month_map = self.df['_Month'].to_dict() if '_Month' in self.df.columns else {}
+        rows = []
+
+        # Iterate over unique composite keys that appear in both output and historic
+        all_ckeys = set(self.historic_vq.keys())
+        # Build a lookup from composite key → output rows
+        out_ckey_map = {}
+        for idx, row in out.iterrows():
+            ckey = self._composite_key(row)
+            out_ckey_map.setdefault(ckey, []).append(idx)
+
+        matched_ckeys = [ck for ck in sorted(all_ckeys, key=lambda x: str(x))
+                         if ck in out_ckey_map]
+
+        for ckey in matched_ckeys:
+            site    = ckey[0]
+            ghg     = ckey[1] if len(ckey) > 1 else ''
+            ghg_sub = ckey[2] if len(ckey) > 2 else ''
+            label   = site + (f' / {ghg}' if ghg else '') + (f' / {ghg_sub}' if ghg_sub else '')
+
+            ckey_out_rows = out.loc[out_ckey_map[ckey]]
+            hist = self.historic_vq[ckey]
+            h_tot, c_tot = 0.0, 0.0
+
+            for month in MONTHS_ORDER:
+                m_idx = [i for i in ckey_out_rows.index if month_map.get(i, '') == month]
+                curr_vq = float(ckey_out_rows.loc[m_idx[0], self.vq_col]) if m_idx else None
+                hist_vq = hist.get(month)
+                if hist_vq is None and 'ANNUAL' in hist:
+                    sf = self.seasonal_patterns.get(month, 1.0)
+                    hist_vq = (hist['ANNUAL'] / 12) * sf
+
+                chg = (curr_vq - hist_vq) if curr_vq is not None and hist_vq else None
+                pct = round(chg / hist_vq * 100, 1) if (chg and hist_vq) else None
+
+                is_est, em, dqs = False, '', None
+                if m_idx and m_idx[0] in out.index:
+                    r = out.loc[m_idx[0]]
+                    is_est = r.get('Data integrity', '') == 'Estimated'
+                    em  = r.get('Estimation Method', '') if is_est else ''
+                    dqs = r.get('Data Quality Score')    if is_est else None
+
+                row_dict = {
+                    'Site': label, 'Month': month,
+                    f'VQ_{hy}': round(hist_vq, 2) if hist_vq else None,
+                    f'VQ_{cy}': round(curr_vq, 2) if curr_vq else None,
+                    'VQ_Change': round(chg, 2) if chg else None,
+                    'VQ_Change_%': pct,
+                    'Estimation Method': em,
+                    'Data Quality Score': round(dqs, 4) if dqs else None,
+                    'Estimated': 'Yes' if is_est else 'No',
+                    'Flag': ('Large change' if pct and abs(pct) > 50
+                             else 'Normal' if pct and abs(pct) < 10
+                             else 'Moderate') if pct else '',
+                }
+                rows.append(row_dict)
+                if hist_vq: h_tot += hist_vq
+                if curr_vq: c_tot += curr_vq
+
+            chg_tot = c_tot - h_tot if h_tot and c_tot else None
+            rows.append({
+                'Site': label, 'Month': 'TOTAL',
+                f'VQ_{hy}': round(h_tot, 2) if h_tot else None,
+                f'VQ_{cy}': round(c_tot, 2) if c_tot else None,
+                'VQ_Change': round(chg_tot, 2) if chg_tot else None,
+                'VQ_Change_%': round(chg_tot / h_tot * 100, 1) if (chg_tot and h_tot) else None,
+                'Estimated': '', 'Flag': '', 'Estimation Method': '', 'Data Quality Score': None,
+            })
+        return pd.DataFrame(rows) if rows else None
+
+    def _sheet_cat_breakdown(self):
+        """
+        Categorical Feature Breakdown sheet.
+        One row per category value per feature, showing:
+        - How many rows and sites it's based on
+        - Mean, min, max VQ
+        - Per-month mean VQ (Jan–Dec columns)
+        This tells you e.g. that 'Brand A' predictions are based on 47 rows across 8 sites.
+        """
+        rows = []
+        for feat, cats in self.cat_breakdown.items():
+            for cat_val, stats in cats.items():
+                row = {
+                    'Feature': feat,
+                    'Category': cat_val,
+                    'N_Rows': stats['n_rows'],
+                    'N_Sites': stats['n_sites'],
+                    'Mean_VQ': stats['mean_vq'],
+                    'Min_VQ':  stats['min_vq'],
+                    'Max_VQ':  stats['max_vq'],
+                }
+                for mo in MONTHS_ORDER:
+                    row[mo] = stats['month_means'].get(mo, '')
+                rows.append(row)
+        if not rows:
+            return pd.DataFrame({'Message': ['No categorical features selected']})
+        return pd.DataFrame(rows)
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+
+    def run(self):
+        self.load()
+        self.run_statistical_tests()
+        self.train_ml_models()
+        results = self.fill_blanks()
+        return self.build_output(results)
