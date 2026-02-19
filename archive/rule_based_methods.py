@@ -94,18 +94,19 @@ def _effective_r2(pearson_r2, pearson_p, spearman_r2, spearman_p,
                   kendall_r2=None, kendall_p=None,
                   pointbiserial_r2=None, pointbiserial_p=None):
     """
-    Best significant R² across all tests (p < 0.05).
+    Best R² across all tests — no significance gate.
+    Blanks need to be filled with the best available signal, even if weak.
     Considers Pearson, Spearman, Kendall τ², and point-biserial r².
-    Returns 0 if no test is significant.
+    Returns 0 if no valid R² found.
     """
     candidates = []
-    if pearson_r2 is not None and pearson_p is not None and pearson_p < 0.05:
+    if pearson_r2 is not None:
         candidates.append(pearson_r2)
-    if spearman_r2 is not None and spearman_p is not None and spearman_p < 0.05:
+    if spearman_r2 is not None:
         candidates.append(spearman_r2)
-    if kendall_r2 is not None and kendall_p is not None and kendall_p < 0.05:
+    if kendall_r2 is not None:
         candidates.append(kendall_r2)
-    if pointbiserial_r2 is not None and pointbiserial_p is not None and pointbiserial_p < 0.05:
+    if pointbiserial_r2 is not None:
         candidates.append(pointbiserial_r2)
     return max(candidates) if candidates else 0.0
 

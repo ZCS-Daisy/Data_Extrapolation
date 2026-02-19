@@ -737,21 +737,24 @@ class ExtrapolationGUI:
 
     def _apply_factor_database(self, complete_df, factor_db_path):
         """
-        Two jobs:
-        1. Use the factor database as a COLUMN TEMPLATE — ensure the output
-           has every column the factor DB has, in the correct order, even if
-           most cells are blank.
-        2. Left-join factor rows onto the output where keys match, filling
-           in emission factor values (EF kgCO2e FU, tCO2e, etc.).
-
-        Column order:
-          [all input columns] → [factor DB columns not already in output]
-
-        Join keys: columns present in both DataFrames that aren't
-        purely result/value columns.
+        Three jobs:
+        1. Strip internal Cross-cat feature columns — these are computation
+           artefacts, not carbon records fields, and must not appear in output.
+        2. Use the factor database as a COLUMN TEMPLATE — the output columns
+           follow the factor DB column order exactly. Any input column not in
+           the factor DB is appended at the end.
+        3. Left-join factor rows onto the output where keys match, filling in
+           emission factor values (EF kgCO2e FU, tCO2e, etc.).
         """
         try:
             print("\n  Applying factor database as column template + lookup...")
+
+            # ── Step 1: strip internal cross-category feature columns ─────────
+            cross_cat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
+            if cross_cat_cols:
+                complete_df = complete_df.drop(columns=cross_cat_cols)
+                print(f"  Removed {len(cross_cat_cols)} internal Cross-cat columns from output")
+
             if factor_db_path.lower().endswith('.csv'):
                 ef_df = pd.read_csv(factor_db_path)
             else:
@@ -770,47 +773,136 @@ class ExtrapolationGUI:
                 'kg CO2e of N2O per unit',
             }
 
-            # ── Step 1: establish join keys ───────────────────────────────────
+            # ── Step 2: establish join keys ───────────────────────────────────
             join_keys = [
                 c for c in ef_df.columns
                 if c in complete_df.columns and c not in value_cols
-                and ef_df[c].notna().mean() > 0.5   # must be mostly populated
+                and ef_df[c].notna().mean() > 0.5
             ]
 
-            # ── Step 2: columns the factor DB adds (not already in output) ────
+            # ── Step 3: join factor values where keys match ────────────────────
             new_ef_cols = [c for c in ef_df.columns if c not in complete_df.columns]
-
             print(f"  Join keys: {join_keys if join_keys else 'none found'}")
             print(f"  New columns from factor DB: {len(new_ef_cols)}")
 
             if join_keys and new_ef_cols:
-                # Deduplicate factor DB on join keys
                 ef_dedup = ef_df[join_keys + new_ef_cols].drop_duplicates(subset=join_keys)
                 merged = complete_df.merge(ef_dedup, on=join_keys, how='left')
                 matched = merged[new_ef_cols[0]].notna().sum()
                 print(f"  ✓ {matched}/{len(merged)} rows matched emission factors")
             elif new_ef_cols:
-                # No join keys found — just add empty columns for template shape
                 print("  ⚠  No join keys — adding empty factor columns for template shape")
                 merged = complete_df.copy()
                 for col in new_ef_cols:
                     merged[col] = np.nan
             else:
-                print("  ⚠  Factor database has no new columns — output unchanged")
-                return complete_df
+                print("  ⚠  Factor database has no new columns — stripping cross-cat only")
+                merged = complete_df.copy()
 
-            # ── Step 3: enforce factor DB column order at the end ─────────────
-            # All original output columns first, then factor DB columns in order
-            output_cols  = list(complete_df.columns)
-            ordered_ef   = [c for c in ef_df.columns if c not in output_cols]
-            final_cols   = output_cols + ordered_ef
-            merged = merged[[c for c in final_cols if c in merged.columns]]
+            # ── Step 4: enforce EXACT factor DB column order ──────────────────
+            # Factor DB columns come first in their exact order.
+            # Any remaining input columns not in the factor DB are appended after.
+            ef_col_order    = list(ef_df.columns)
+            remaining_input = [c for c in complete_df.columns if c not in ef_col_order]
+            final_order     = ef_col_order + remaining_input
+            merged = merged[[c for c in final_order if c in merged.columns]]
 
             return merged
 
         except Exception as e:
             print(f"  ⚠  Factor database error: {e} — output unchanged")
-            return complete_df
+            # Still strip cross-cat columns even if factor DB fails
+            cross_cat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
+            return complete_df.drop(columns=cross_cat_cols, errors='ignore')
+
+    def _build_xcat_sheet(self, complete_df, tool):
+        """
+        Build the Cross-Category Features explanation sheet.
+        Shows each injected feature, how it was calculated, its correlation
+        with VQ in the training data, and whether it was actually selected
+        as the best prediction method for any rows.
+        """
+        xcat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
+        if not xcat_cols:
+            return None
+
+        rows = []
+        # Which methods were actually used in predictions?
+        used_methods = set()
+        if 'Estimation Method' in complete_df.columns:
+            used_methods = set(complete_df['Estimation Method'].dropna().unique())
+
+        for col in xcat_cols:
+            # Parse the label: "Cross-cat: Electricity (Location Based) | fleet index"
+            label = col.replace('Cross-cat: ', '')
+            if ' | ' in label:
+                category_part, metric_part = label.split(' | ', 1)
+            else:
+                category_part, metric_part = label, ''
+
+            is_fleet     = 'fleet index' in metric_part
+            is_intensity = 'intensity'   in metric_part
+
+            if is_fleet:
+                how_calculated = (
+                    f"Site's annual {category_part} VQ ÷ fleet mean annual {category_part} VQ. "
+                    f"Value of 1.0 = average; >1.0 = above average consumer; <1.0 = below average. "
+                    f"Annualised: monthly data scaled to 12 months before computing."
+                )
+            elif is_intensity:
+                how_calculated = (
+                    f"Site's annual {category_part} VQ ÷ site's annual Turnover. "
+                    f"Dimensionless ratio — comparable across sites regardless of size. "
+                    f"Annualised: monthly data scaled to 12 months before computing."
+                )
+            else:
+                how_calculated = f"Derived from {category_part} VQ."
+
+            # Correlation with VQ in known rows
+            pearson_r, spearman_r, fill_pct = '', '', ''
+            if col in tool.df.columns and tool.vq_col in tool.df.columns:
+                known = tool.df[tool.df[tool.vq_col].notna() & tool.df[col].notna()]
+                n = len(known)
+                fill_pct = f"{n}/{len(tool.df)} rows ({n/len(tool.df)*100:.0f}%)"
+                if n >= 4:
+                    try:
+                        pr = known[col].corr(known[tool.vq_col], method='pearson')
+                        sr = known[col].corr(known[tool.vq_col], method='spearman')
+                        pearson_r  = f"{pr:.3f}" if pd.notna(pr) else ''
+                        spearman_r = f"{sr:.3f}" if pd.notna(sr) else ''
+                    except Exception:
+                        pass
+
+            # Check if used directly or as part of an Intensity_ or ML method
+            intensity_method = f'Intensity_{col}'
+            used_directly = (
+                intensity_method in used_methods
+                or any(col in m for m in used_methods if 'ML' in m or 'GBT' in m or 'RF' in m)
+            )
+            # Also check stat_methods for the effective R2
+            stat_info = tool.stat_methods.get(intensity_method, {})
+            eff_r2 = stat_info.get('effective_r2', '')
+            if eff_r2 != '':
+                eff_r2 = f"{eff_r2:.4f}"
+
+            rows.append({
+                'Feature Name':        col,
+                'GHG Category':        category_part,
+                'Metric Type':         'Fleet Index' if is_fleet else 'Turnover Intensity',
+                'How Calculated':      how_calculated,
+                'Data Fill Rate':      fill_pct,
+                'Pearson r vs VQ':     pearson_r,
+                'Spearman r vs VQ':    spearman_r,
+                'Effective R² (stat)': eff_r2,
+                'Used in Predictions': 'Yes' if used_directly else 'No',
+                'Note': (
+                    "Fleet index is dimensionless — a ratio relative to portfolio average. "
+                    "Intensity is VQ per unit of Turnover. Neither uses raw VQ directly, "
+                    "so cross-unit contamination (kWh vs litres) is avoided."
+                ),
+            })
+
+        return pd.DataFrame(rows)
 
     def _run(self):
         try:
@@ -829,9 +921,17 @@ class ExtrapolationGUI:
 
             complete, avail, stat, ml, cat_bkd, yoy = tool.run()
 
-            # ── Apply factor database if loaded ───────────────────────────────
+            # ── Build cross-category features sheet (before stripping cols) ───
+            xcat_sheet = self._build_xcat_sheet(complete, tool)
+
+            # ── Apply factor database (also strips cross-cat cols + reorders) ─
             if factor_db:
                 complete = self._apply_factor_database(complete, factor_db)
+            else:
+                # No factor DB — just strip the internal cross-cat columns
+                cross_cat_cols = [c for c in complete.columns if c.startswith('Cross-cat:')]
+                if cross_cat_cols:
+                    complete = complete.drop(columns=cross_cat_cols)
 
             base = input_file.rsplit('.', 1)[0]
             output_file = base + ' - Extrapolated.xlsx'
@@ -876,6 +976,11 @@ class ExtrapolationGUI:
                     sheet_num += 1
                 else:
                     print("  (YoY Analysis sheet skipped — no historic records provided)")
+
+                if xcat_sheet is not None and len(xcat_sheet):
+                    xcat_sheet.to_excel(writer, sheet_name='Cross-Category Features', index=False)
+                    print(f"✓ Sheet {sheet_num}: Cross-Category Features ({len(xcat_sheet)} features)")
+                    sheet_num += 1
 
             print(f"\n✓ Output saved to:\n  {output_file}\n")
             print('=' * 60)

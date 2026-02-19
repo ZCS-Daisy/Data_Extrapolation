@@ -32,27 +32,22 @@ def analyze_feature_column(dataframe, column_name):
         'details': {}
     }
 
-    # CRITICAL FIX: Try to convert to numeric first if stored as text
     is_numeric = pd.api.types.is_numeric_dtype(col_data)
 
     if not is_numeric:
-        # Try to convert to numeric - handles text-formatted numbers
         try:
-            # Attempt conversion
             numeric_conversion = pd.to_numeric(non_null, errors='coerce')
             successful_conversions = numeric_conversion.notna().sum()
             conversion_rate = successful_conversions / len(non_null) if len(non_null) > 0 else 0
 
-            # If >80% of values can be converted to numeric, treat as numeric
             if conversion_rate > 0.8:
                 is_numeric = True
                 col_data = pd.to_numeric(col_data, errors='coerce')
                 non_null = col_data.dropna()
                 print(f"  ✓ Converted '{column_name}' from text to numeric ({conversion_rate * 100:.0f}% successful)")
         except:
-            pass  # Keep as non-numeric if conversion fails
+            pass
 
-    # Determine type and analyze
     if is_numeric:
         analysis['type'] = 'Numerical'
         analysis['details'] = {
@@ -62,7 +57,6 @@ def analyze_feature_column(dataframe, column_name):
             'std': float(non_null.std())
         }
 
-        # Recommendation logic for numerical
         if completeness < 0.2:
             analysis['recommendation'] = 'Skip'
             analysis['reason'] = f'Only {completeness * 100:.0f}% complete - too sparse for reliable predictions'
@@ -74,7 +68,6 @@ def analyze_feature_column(dataframe, column_name):
             analysis['reason'] = f'Good coverage ({completeness * 100:.0f}%) with variance - helpful for predictions'
 
     else:
-        # Categorical
         analysis['type'] = 'Categorical'
         unique_count = non_null.nunique()
         value_counts = non_null.value_counts()
@@ -84,7 +77,6 @@ def analyze_feature_column(dataframe, column_name):
             'most_common': value_counts.head(5).to_dict()
         }
 
-        # Recommendation logic for categorical
         if completeness < 0.2:
             analysis['recommendation'] = 'Skip'
             analysis['reason'] = f'Only {completeness * 100:.0f}% complete - too sparse'
@@ -114,16 +106,13 @@ class ColumnSelectionDialog:
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
-        # Allow X button to close (treat as Skip All)
         self.dialog.protocol("WM_DELETE_WINDOW", self.skip_all)
 
-        # Center on parent
         self.dialog.update_idletasks()
         x = parent.winfo_x() + (parent.winfo_width() // 2) - (800 // 2)
         y = parent.winfo_y() + (parent.winfo_height() // 2) - (600 // 2)
         self.dialog.geometry(f"+{x}+{y}")
 
-        # Title frame - fixed at top
         title_frame = tk.Frame(self.dialog, bg='white', pady=15, padx=20)
         title_frame.pack(fill="x", side="top")
 
@@ -136,7 +125,6 @@ class ColumnSelectionDialog:
                             font=('Segoe UI', 9), foreground="#7F8C8D", bg='white')
         subtitle.pack(pady=(3, 0))
 
-        # Scrollable container
         container = ttk.Frame(self.dialog)
         container.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
@@ -153,12 +141,10 @@ class ColumnSelectionDialog:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Create column widgets
         self.checkboxes = {}
         for i, analysis in enumerate(columns_analysis):
             self.create_column_widget(self.scrollable_frame, analysis, i)
 
-        # Button frame
         button_frame = tk.Frame(self.dialog, bg='#f0f0f0', pady=12, padx=15)
         button_frame.pack(fill="x", side="bottom")
 
@@ -181,19 +167,16 @@ class ColumnSelectionDialog:
                   bg='#95A5A6', fg='white',
                   relief=tk.FLAT, **btn_style).pack(side="left", padx=3)
 
-        # Track checkbox changes
         for var in self.checkboxes.values():
             var.trace_add('write', lambda *args: self.update_button_text())
 
         self.dialog.wait_window()
 
     def update_button_text(self):
-        """Update button text to show count of selected items"""
         count = sum(1 for var in self.checkboxes.values() if var.get())
         self.use_selected_btn.config(text=f"Use Selected ({count})")
 
     def create_column_widget(self, parent, analysis, index):
-        """Create a widget for one column with detailed information"""
         outer_frame = ttk.Frame(parent)
         outer_frame.pack(fill="x", padx=5, pady=6)
 
@@ -263,7 +246,6 @@ class ExtrapolationGUI:
         self.root.geometry("1200x850")
         self.root.resizable(True, True)
 
-        # Color scheme
         self.bg_main = "#E8E8E8"
         self.bg_card = "#FFFFFF"
         self.primary = "#2C3E50"
@@ -273,7 +255,6 @@ class ExtrapolationGUI:
         self.text_light = "#7F8C8D"
         self.root.configure(bg=self.bg_main)
 
-        # Variables
         self.input_file_path = tk.StringVar()
         self.factor_db_path = tk.StringVar()
         self.config_file = Path.home() / '.extrapolation_config.json'
@@ -286,17 +267,14 @@ class ExtrapolationGUI:
 
         self.create_widgets()
 
-        # Redirect stdout to the text widget
         sys.stdout = TextRedirector(self.log_text)
 
     def load_config(self):
-        """Load saved configuration from file"""
         try:
             if self.config_file.exists():
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
 
-                # Restore Factor Database path if it exists and file still exists
                 if 'factor_db_path' in config:
                     saved_path = config['factor_db_path']
                     if saved_path and Path(saved_path).exists():
@@ -308,69 +286,43 @@ class ExtrapolationGUI:
             print(f"⚠️  Could not load config: {e}")
 
     def save_config(self):
-        """Save configuration to file"""
         try:
             config = {
                 'factor_db_path': self.factor_db_path.get() if self.factor_db_path.get() else None
             }
-
             with open(self.config_file, 'w') as f:
                 json.dump(config, f, indent=2)
         except Exception as e:
             print(f"⚠️  Could not save config: {e}")
 
     def create_widgets(self):
-        # Configure styles
         style = ttk.Style()
         style.theme_use('clam')
 
         style.configure('Modern.TButton',
-                        background=self.accent,
-                        foreground='white',
-                        borderwidth=0,
-                        focuscolor='none',
-                        padding=10,
+                        background=self.accent, foreground='white',
+                        borderwidth=0, focuscolor='none', padding=10,
                         font=('Segoe UI', 10))
-        style.map('Modern.TButton',
-                  background=[('active', '#2980B9')])
+        style.map('Modern.TButton', background=[('active', '#2980B9')])
 
         style.configure('Template.TButton',
-                        background='#BDC3C7',
-                        foreground='white',
-                        borderwidth=0,
-                        focuscolor='none',
-                        padding=10,
+                        background='#BDC3C7', foreground='white',
+                        borderwidth=0, focuscolor='none', padding=10,
                         font=('Segoe UI', 9))
-        style.map('Template.TButton',
-                  background=[('active', '#95A5A6')])
+        style.map('Template.TButton', background=[('active', '#95A5A6')])
 
-        style.configure('Card.TLabelframe',
-                        background=self.bg_card,
-                        borderwidth=0,
-                        relief='flat')
+        style.configure('Card.TLabelframe', background=self.bg_card, borderwidth=0, relief='flat')
         style.configure('Card.TLabelframe.Label',
-                        background=self.bg_card,
-                        foreground=self.text_dark,
+                        background=self.bg_card, foreground=self.text_dark,
                         font=('Segoe UI', 10, 'bold'))
-
-        style.configure('TLabel',
-                        background=self.bg_card,
-                        foreground=self.text_dark,
-                        font=('Segoe UI', 9))
-
+        style.configure('TLabel', background=self.bg_card, foreground=self.text_dark, font=('Segoe UI', 9))
         style.configure('Modern.Horizontal.TProgressbar',
-                        background=self.accent,
-                        troughcolor=self.bg_main,
-                        borderwidth=0,
-                        thickness=8)
+                        background=self.accent, troughcolor=self.bg_main, borderwidth=0, thickness=8)
 
-        # Main container
         main_container = ttk.Frame(self.root, style='Modern.TFrame')
         main_container.pack(fill="both", expand=True)
-
         style.configure('Modern.TFrame', background=self.bg_main)
 
-        # Create canvas with scrollbar
         canvas = tk.Canvas(main_container, bg=self.bg_main, highlightthickness=0, bd=0)
         scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas, style='Modern.TFrame')
@@ -383,8 +335,7 @@ class ExtrapolationGUI:
         canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 
         def configure_canvas_width(event):
-            canvas_width = event.width
-            canvas.itemconfig(canvas_window, width=canvas_width)
+            canvas.itemconfig(canvas_window, width=event.width)
 
         canvas.bind('<Configure>', configure_canvas_width)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -392,7 +343,6 @@ class ExtrapolationGUI:
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        # Enable mousewheel scrolling
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
@@ -401,76 +351,57 @@ class ExtrapolationGUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Title Frame
+        # Title
         title_frame = ttk.Frame(scrollable_frame, style='Modern.TFrame', padding="20 20 20 10")
         title_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
 
-        title_label = ttk.Label(
-            title_frame,
-            text="Extrapolation",
-            font=('Segoe UI', 28, 'bold'),
-            foreground=self.primary,
-            background=self.bg_main
-        )
-        title_label.pack(anchor="w")
+        ttk.Label(title_frame, text="Extrapolation",
+                  font=('Segoe UI', 28, 'bold'), foreground=self.primary,
+                  background=self.bg_main).pack(anchor="w")
+        ttk.Label(title_frame,
+                  text="Extrapolate blank volumetric quantities using Machine Learning and historic data patterns",
+                  font=('Segoe UI', 11), foreground=self.text_light,
+                  background=self.bg_main).pack(anchor="w", pady=(5, 0))
 
-        subtitle_label = ttk.Label(
-            title_frame,
-            text="Extrapolate blank volumetric quantities using Machine Learning and historic data patterns",
-            font=('Segoe UI', 11),
-            foreground=self.text_light,
-            background=self.bg_main
-        )
-        subtitle_label.pack(anchor="w", pady=(5, 0))
-
-        # File Selection Frame
+        # File Selection
         file_frame = ttk.LabelFrame(scrollable_frame, style='Card.TLabelframe', text="File Selection", padding="20")
         file_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), padx=0, pady=(0, 1))
 
-        # Input File
         ttk.Label(file_frame, text="Input File:", font=('Segoe UI', 9, 'bold')).grid(
             row=0, column=0, sticky=tk.W, pady=(10, 5), padx=(0, 10))
         ttk.Entry(file_frame, textvariable=self.input_file_path, width=55, font=('Segoe UI', 9)).grid(
             row=0, column=1, padx=5, pady=(10, 5))
-        ttk.Button(file_frame, text="Browse", command=self.browse_input_file, style='Modern.TButton', width=12).grid(
-            row=0, column=2, pady=(10, 5), padx=(5, 5))
+        ttk.Button(file_frame, text="Browse", command=self.browse_input_file,
+                   style='Modern.TButton', width=12).grid(row=0, column=2, pady=(10, 5), padx=(5, 5))
         ttk.Button(file_frame, text="Export Template", command=self.export_input_template,
-                   style='Template.TButton', width=15).grid(
-            row=0, column=3, pady=(10, 5), padx=(0, 0))
+                   style='Template.TButton', width=15).grid(row=0, column=3, pady=(10, 5), padx=(0, 0))
 
-        # Historic Records
         ttk.Label(file_frame, text="Historic Records (Optional):", font=('Segoe UI', 9)).grid(
             row=1, column=0, sticky=tk.W, pady=5, padx=(0, 10))
         ttk.Entry(file_frame, textvariable=self.historic_records_path, width=55, font=('Segoe UI', 9)).grid(
             row=1, column=1, padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=self.browse_historic_records, style='Modern.TButton',
-                   width=12).grid(
-            row=1, column=2, pady=5, padx=(5, 5))
+        ttk.Button(file_frame, text="Browse", command=self.browse_historic_records,
+                   style='Modern.TButton', width=12).grid(row=1, column=2, pady=5, padx=(5, 5))
         ttk.Button(file_frame, text="Export Template", command=self.export_historic_records_template,
-                   style='Template.TButton', width=15).grid(
-            row=1, column=3, pady=5, padx=(0, 0))
+                   style='Template.TButton', width=15).grid(row=1, column=3, pady=5, padx=(0, 0))
 
-        # Historic Features
         ttk.Label(file_frame, text="Historic Features (Optional):", font=('Segoe UI', 9)).grid(
             row=2, column=0, sticky=tk.W, pady=5, padx=(0, 10))
         ttk.Entry(file_frame, textvariable=self.historic_features_path, width=55, font=('Segoe UI', 9)).grid(
             row=2, column=1, padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=self.browse_historic_features, style='Modern.TButton',
-                   width=12).grid(
-            row=2, column=2, pady=5, padx=(5, 5))
+        ttk.Button(file_frame, text="Browse", command=self.browse_historic_features,
+                   style='Modern.TButton', width=12).grid(row=2, column=2, pady=5, padx=(5, 5))
         ttk.Button(file_frame, text="Export Template", command=self.export_historic_features_template,
-                   style='Template.TButton', width=15).grid(
-            row=2, column=3, pady=5, padx=(0, 0))
+                   style='Template.TButton', width=15).grid(row=2, column=3, pady=5, padx=(0, 0))
 
-        # Factor Database
         ttk.Label(file_frame, text="Factor Database:", font=('Segoe UI', 9, 'bold')).grid(
             row=3, column=0, sticky=tk.W, pady=(5, 10), padx=(0, 10))
         ttk.Entry(file_frame, textvariable=self.factor_db_path, width=55, font=('Segoe UI', 9)).grid(
             row=3, column=1, padx=5, pady=(5, 10))
-        ttk.Button(file_frame, text="Browse", command=self.browse_factor_db, style='Modern.TButton', width=12).grid(
-            row=3, column=2, pady=(5, 10), padx=(5, 5))
+        ttk.Button(file_frame, text="Browse", command=self.browse_factor_db,
+                   style='Modern.TButton', width=12).grid(row=3, column=2, pady=(5, 10), padx=(5, 5))
 
-        # About Frame
+        # About
         about_frame = ttk.LabelFrame(scrollable_frame, style='Card.TLabelframe', text="About This Tool", padding="20")
         about_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=0, pady=1)
 
@@ -490,153 +421,98 @@ Optional - To Improve Predictions:
     • Historic Records: Previous years' volumetric quantities (same format as output)
     • Historic Features: Previous years' turnover, sq ft, or other features by site"""
 
-        ttk.Label(
-            about_frame,
-            text=about_text,
-            justify=tk.LEFT,
-            font=('Segoe UI', 9),
-            foreground=self.text_dark
-        ).pack(anchor="w")
+        ttk.Label(about_frame, text=about_text, justify=tk.LEFT,
+                  font=('Segoe UI', 9), foreground=self.text_dark).pack(anchor="w")
 
-        # Progress Frame
+        # Progress
         progress_frame = ttk.Frame(scrollable_frame, style='Modern.TFrame', padding="20 15")
         progress_frame.grid(row=3, column=0, sticky=(tk.W, tk.E))
 
         self.progress_bar = ttk.Progressbar(
-            progress_frame,
-            mode='indeterminate',
-            length=1140,
+            progress_frame, mode='indeterminate', length=1140,
             style='Modern.Horizontal.TProgressbar'
         )
         self.progress_bar.pack(fill="x")
 
         self.status_label = ttk.Label(
-            progress_frame,
-            text="Ready to process",
-            foreground=self.success,
-            background=self.bg_main,
-            font=('Segoe UI', 11, 'bold')
+            progress_frame, text="Ready to process", foreground=self.success,
+            background=self.bg_main, font=('Segoe UI', 11, 'bold')
         )
         self.status_label.pack(pady=8)
 
-        # Buttons Frame
+        # Buttons
         button_frame = ttk.Frame(scrollable_frame, style='Modern.TFrame', padding="0 10 20 15")
         button_frame.grid(row=4, column=0, sticky=(tk.W, tk.E))
 
         self.process_button = ttk.Button(
-            button_frame,
-            text="Process Data",
-            command=self.process_data,
-            style='Modern.TButton',
-            width=18
+            button_frame, text="Process Data", command=self.process_data,
+            style='Modern.TButton', width=18
         )
         self.process_button.pack(side="left", padx=(20, 5))
 
-        ttk.Button(
-            button_frame,
-            text="Clear Log",
-            command=self.clear_log,
-            style='Modern.TButton',
-            width=18
-        ).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Clear Log", command=self.clear_log,
+                   style='Modern.TButton', width=18).pack(side="left", padx=5)
 
         self.add_features_button = ttk.Button(
-            button_frame,
-            text="Add Features",
-            command=self.add_features,
-            style='Modern.TButton',
-            state='normal',
-            width=18
+            button_frame, text="Add Features", command=self.add_features,
+            style='Modern.TButton', state='normal', width=18
         )
         self.add_features_button.pack(side="left", padx=5)
 
-        # Log Frame
+        # Log
         log_frame = ttk.LabelFrame(scrollable_frame, style='Card.TLabelframe', text="Processing Log", padding="20")
         log_frame.grid(row=5, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=0, pady=(1, 0))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            width=140,
-            height=18,
-            wrap=tk.WORD,
-            font=('Consolas', 9),
-            bg='white',
-            relief=tk.FLAT,
-            borderwidth=0
+            log_frame, width=140, height=18, wrap=tk.WORD,
+            font=('Consolas', 9), bg='white', relief=tk.FLAT, borderwidth=0
         )
         self.log_text.pack(fill="both", expand=True)
 
-        # Configure grid weights
         scrollable_frame.columnconfigure(0, weight=1)
         scrollable_frame.rowconfigure(5, weight=1)
 
-        # Save config on close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def on_closing(self):
-        """Handle window closing"""
         self.save_config()
         self.root.destroy()
 
     def export_input_template(self):
-        """Export template for Input File"""
         filename = filedialog.asksaveasfilename(
-            title="Save Input File Template",
-            defaultextension=".xlsx",
+            title="Save Input File Template", defaultextension=".xlsx",
             filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")],
             initialfile="Input_Template.xlsx"
         )
-
         if filename:
             try:
                 template_df = pd.DataFrame(columns=[
-                    'Brand',
-                    'Site identifier',
-                    'Location',
-                    'Data timeframe',
-                    'Date from',
-                    'Date to',
-                    'GHG Category',
-                    'Volumetric Quantity',
-                    'Turnover'
+                    'Brand', 'Site identifier', 'Location', 'Data timeframe',
+                    'Date from', 'Date to', 'GHG Category', 'Volumetric Quantity', 'Turnover'
                 ])
-
                 template_df.loc[0] = [
-                    'Example Brand',
-                    'SITE001',
-                    'London, UK',
-                    'Monthly',
-                    '01/01/2025',
-                    '31/01/2025',
-                    'Category 3',
-                    '',
-                    '50000'
+                    'Example Brand', 'SITE001', 'London, UK', 'Monthly',
+                    '01/01/2025', '31/01/2025', 'Category 3', '', '50000'
                 ]
-
                 if filename.endswith('.csv'):
                     template_df.to_csv(filename, index=False)
                 else:
                     template_df.to_excel(filename, index=False)
 
                 self.input_file_path.set(filename)
-
                 print(f"\n✓ Input template exported: {filename}")
                 print("  Fill in the template and click 'Process Data' when ready!")
 
-                if messagebox.askyesno("Template Exported",
-                                       f"Template saved to:\n{filename}\n\nOpen it now?"):
+                if messagebox.askyesno("Template Exported", f"Template saved to:\n{filename}\n\nOpen it now?"):
                     os.startfile(filename)
-
             except Exception as e:
                 messagebox.showerror("Error", f"Could not export template: {e}")
 
     def export_historic_records_template(self):
-        """Export template for Historic Records (same format as Factor Database)"""
         if self.factor_db_path.get() and Path(self.factor_db_path.get()).exists():
             try:
                 factor_df = pd.read_csv(self.factor_db_path.get())
                 template_df = pd.DataFrame(columns=factor_df.columns)
-
                 example_row = {}
                 for col in factor_df.columns:
                     if col == 'Site identifier':
@@ -649,9 +525,7 @@ Optional - To Improve Predictions:
                         example_row[col] = '120000'
                     else:
                         example_row[col] = ''
-
                 template_df = pd.concat([template_df, pd.DataFrame([example_row])], ignore_index=True)
-
             except Exception as e:
                 print(f"⚠️  Could not read Factor Database: {e}")
                 template_df = self._get_default_historic_records_template()
@@ -659,39 +533,29 @@ Optional - To Improve Predictions:
             template_df = self._get_default_historic_records_template()
 
         filename = filedialog.asksaveasfilename(
-            title="Save Historic Records Template",
-            defaultextension=".xlsx",
+            title="Save Historic Records Template", defaultextension=".xlsx",
             filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")],
             initialfile="Historic_Records_Template.xlsx"
         )
-
         if filename:
             try:
                 if filename.endswith('.csv'):
                     template_df.to_csv(filename, index=False)
                 else:
                     template_df.to_excel(filename, index=False)
-
                 self.historic_records_path.set(filename)
-
                 print(f"\n✓ Historic Records template exported: {filename}")
-                print("  Fill in previous years' volumetric quantities!")
-
-                if messagebox.askyesno("Template Exported",
-                                       f"Template saved to:\n{filename}\n\nOpen it now?"):
+                if messagebox.askyesno("Template Exported", f"Template saved to:\n{filename}\n\nOpen it now?"):
                     os.startfile(filename)
-
             except Exception as e:
                 messagebox.showerror("Error", f"Could not export template: {e}")
 
     def export_historic_features_template(self):
-        """Export template for Historic Features (same as Historic Records but NO Volumetric Quantity)"""
         if self.factor_db_path.get() and Path(self.factor_db_path.get()).exists():
             try:
                 factor_df = pd.read_csv(self.factor_db_path.get())
                 columns = [col for col in factor_df.columns if col != 'Volumetric Quantity']
                 template_df = pd.DataFrame(columns=columns)
-
                 example_row = {}
                 for col in columns:
                     if col == 'Site identifier':
@@ -704,9 +568,7 @@ Optional - To Improve Predictions:
                         example_row[col] = '500000'
                     else:
                         example_row[col] = ''
-
                 template_df = pd.concat([template_df, pd.DataFrame([example_row])], ignore_index=True)
-
             except Exception as e:
                 print(f"⚠️  Could not read Factor Database: {e}")
                 template_df = self._get_default_historic_features_template()
@@ -714,83 +576,43 @@ Optional - To Improve Predictions:
             template_df = self._get_default_historic_features_template()
 
         filename = filedialog.asksaveasfilename(
-            title="Save Historic Features Template",
-            defaultextension=".xlsx",
+            title="Save Historic Features Template", defaultextension=".xlsx",
             filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")],
             initialfile="Historic_Features_Template.xlsx"
         )
-
         if filename:
             try:
                 if filename.endswith('.csv'):
                     template_df.to_csv(filename, index=False)
                 else:
                     template_df.to_excel(filename, index=False)
-
                 self.historic_features_path.set(filename)
-
                 print(f"\n✓ Historic Features template exported: {filename}")
-                print("  Fill in previous years' turnover, sq ft, etc. (NO volumetric quantities)!")
-
-                if messagebox.askyesno("Template Exported",
-                                       f"Template saved to:\n{filename}\n\nOpen it now?"):
+                if messagebox.askyesno("Template Exported", f"Template saved to:\n{filename}\n\nOpen it now?"):
                     os.startfile(filename)
-
             except Exception as e:
                 messagebox.showerror("Error", f"Could not export template: {e}")
 
     def _get_default_historic_records_template(self):
-        """Get default Historic Records template structure"""
         template_df = pd.DataFrame(columns=[
-            'Client',
-            'Site identifier',
-            'Location',
-            'Date from',
-            'Date to',
-            'GHG Category',
-            'Volumetric Quantity',
-            'Timeframe',
-            'Year'
+            'Client', 'Site identifier', 'Location', 'Date from', 'Date to',
+            'GHG Category', 'Volumetric Quantity', 'Timeframe', 'Year'
         ])
-
         template_df.loc[0] = [
-            'Example Client',
-            'SITE001',
-            'London, UK',
-            '01/01/2024',
-            '31/12/2024',
-            'Category 3',
-            '120000',
-            'Annual',
-            '2024'
+            'Example Client', 'SITE001', 'London, UK', '01/01/2024', '31/12/2024',
+            'Category 3', '120000', 'Annual', '2024'
         ]
-
         return template_df
 
     def _get_default_historic_features_template(self):
-        """Get default Historic Features template structure"""
         template_df = pd.DataFrame(columns=[
-            'Client',
-            'Site identifier',
-            'Location',
-            'Date from',
-            'Date to',
-            'Turnover',
-            'SqFt',
-            'Year'
+            'Client', 'Site identifier', 'Location', 'Date from', 'Date to',
+            'Turnover', 'SqFt', 'Year'
         ])
-
         template_df.loc[0] = [
-            'Example Client',
-            'SITE001',
-            'London, UK',
-            '01/01/2024',
-            '31/12/2024',
-            '500000',
-            '5000',
-            '2024'
+            'Example Client', 'SITE001', 'London, UK', '01/01/2024', '31/12/2024',
+            '500000', '5000', '2024'
         ]
-
         return template_df
 
     def browse_input_file(self):
@@ -840,7 +662,6 @@ Optional - To Improve Predictions:
             print(f"\n✓ Factor Database selected and saved: {Path(filename).name}")
 
     def add_features(self):
-        """Open dialog to select features for ML models"""
         if self.loaded_data is None:
             if self.input_file_path.get():
                 try:
@@ -854,10 +675,7 @@ Optional - To Improve Predictions:
                     messagebox.showerror("Error", f"Could not load file: {e}")
                     return
             else:
-                messagebox.showwarning(
-                    "No Data Loaded",
-                    "Please load an input file first using the Browse button"
-                )
+                messagebox.showwarning("No Data Loaded", "Please load an input file first using the Browse button")
                 return
 
         available_features = []
@@ -870,10 +688,7 @@ Optional - To Improve Predictions:
         print(f"\n📊 Detected {len(available_features)} additional columns:")
 
         if not available_features:
-            messagebox.showinfo(
-                "No Additional Features",
-                "No additional features detected in the data."
-            )
+            messagebox.showinfo("No Additional Features", "No additional features detected in the data.")
             return
 
         columns_analysis = []
@@ -921,7 +736,6 @@ Optional - To Improve Predictions:
         self.status_label.config(text=message, foreground=color)
 
     def process_data(self):
-        """Process the data using the extrapolation logic"""
         if self.is_processing:
             messagebox.showwarning("Processing", "Already processing data. Please wait.")
             return
@@ -930,13 +744,11 @@ Optional - To Improve Predictions:
             messagebox.showerror("Error", "Please select an input data file")
             return
 
-        # Start processing
         self.is_processing = True
         self.process_button.config(state='disabled')
         self.progress_bar.start()
         self.update_status("Processing...", "blue")
 
-        # Run in separate thread
         thread = threading.Thread(target=self.run_extrapolation, daemon=True)
         thread.start()
 
@@ -951,7 +763,6 @@ Optional - To Improve Predictions:
             print("STARTING DATA EXTRAPOLATION WITH HISTORIC DATA")
             print("=" * 70 + "\n")
 
-            # Check brand data sufficiency if Brand is selected
             final_features = self.selected_features.copy()
             if 'Brand' in self.selected_features and self.loaded_data is not None:
                 if 'Brand' in self.loaded_data.columns:
@@ -974,9 +785,7 @@ Optional - To Improve Predictions:
 
                         def ask_user():
                             user_choice['response'] = messagebox.askyesno(
-                                "Brand Data Warning",
-                                message,
-                                icon='warning'
+                                "Brand Data Warning", message, icon='warning'
                             )
 
                         self.root.after(0, ask_user)
@@ -993,7 +802,6 @@ Optional - To Improve Predictions:
                             print("\n⚠️  User chose to KEEP Brand feature despite insufficient data")
                             print("    Proceeding with caution - results may vary by brand\n")
 
-            # Initialize the tool
             tool = VolumetricExtrapolationTool(
                 extrapolate_file=input_file,
                 factor_database_file=factor_db,
@@ -1002,9 +810,9 @@ Optional - To Improve Predictions:
                 historic_features_file=historic_features
             )
 
-            output_df, results, model_testing_matrix, model_performance, data_availability, historic_analysis, training_data = tool.run_extrapolation()
+            # FIX: Unpack 8 values (rule_based_sheet added)
+            output_df, results, model_testing_matrix, model_performance, data_availability, historic_analysis, training_data, rule_based_sheet = tool.run_extrapolation()
 
-            # Determine output filename
             if input_file.endswith('.csv'):
                 output_file = input_file.replace(".csv", " - With extrapolated.xlsx")
             else:
@@ -1014,7 +822,6 @@ Optional - To Improve Predictions:
             print("SAVING RESULTS")
             print(f"{'=' * 70}\n")
 
-            # Create multi-sheet Excel output
             with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
                 # Sheet 1: Complete Records
                 if factor_db:
@@ -1053,7 +860,6 @@ Optional - To Improve Predictions:
                         summary_cols.insert(1, 'Brand')
                     if 'Turnover' in estimated_rows.columns:
                         summary_cols.insert(-4, 'Turnover')
-
                     if 'Data_Months' in estimated_rows.columns:
                         summary_cols.append('Data_Months')
                     if 'Data_Has_Turnover' in estimated_rows.columns:
@@ -1116,6 +922,15 @@ Optional - To Improve Predictions:
                         writer, sheet_name='Training Data', index=False)
                     print("✓ Sheet 7: Training Data (no data)")
 
+                # Sheet 8: Rule Based Methods
+                if rule_based_sheet is not None and len(rule_based_sheet) > 0:
+                    rule_based_sheet.to_excel(writer, sheet_name='Rule_Based_Methods', index=False)
+                    print(f"✓ Sheet 8: Rule Based Methods ({len(rule_based_sheet)} methods)")
+                else:
+                    pd.DataFrame({'Message': ['No rule-based method data available']}).to_excel(
+                        writer, sheet_name='Rule_Based_Methods', index=False)
+                    print("✓ Sheet 8: Rule Based Methods (no data)")
+
             print(f"\n✓ Multi-sheet Excel saved to:\n  {output_file}\n")
             print("=" * 70)
             print("PROCESSING COMPLETE!")
@@ -1123,10 +938,8 @@ Optional - To Improve Predictions:
 
             self.root.after(0, lambda: self.update_status("Processing complete!", "green"))
             self.root.after(0, lambda: messagebox.showinfo(
-                "Success",
-                f"Processing complete!\n\nOutput saved to:\n{output_file}"
+                "Success", f"Processing complete!\n\nOutput saved to:\n{output_file}"
             ))
-
             self.root.after(0, lambda: self.ask_open_file(output_file))
 
         except Exception as e:
@@ -1151,8 +964,6 @@ Optional - To Improve Predictions:
 
 
 class TextRedirector:
-    """Helper class to redirect stdout to the GUI text widget"""
-
     def __init__(self, text_widget):
         self.text_widget = text_widget
 

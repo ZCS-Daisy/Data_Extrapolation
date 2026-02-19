@@ -14,6 +14,14 @@ Pipeline:
   6. Per-row selection: highest effective R2 wins
   7. Output: Complete Records, Data Availability, Statistical Analysis,
      Machine Learning Models (with train/test row detail), YoY Analysis
+
+FIXES (latest):
+  FIX 1 — VQ column is always 'Volumetric Quantity' (strict exact match, no fuzzy)
+  FIX 2 — GHG Category is REQUIRED. All stat tests, ML models, seasonal indices,
+           and predictions are scoped to matching GHG Category + Sub Category only.
+  FIX 3 — Popup errors for: missing Date from/to columns, unparseable dates,
+           missing VQ column, missing GHG Category column. Popup warnings for
+           softer issues in historic files.
 """
 
 import pandas as pd
@@ -28,6 +36,8 @@ from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import cross_val_score, KFold, LeaveOneOut
 from collections import defaultdict
 import warnings
+import tkinter as tk
+from tkinter import messagebox
 warnings.filterwarnings('ignore')
 
 MONTHS_ORDER = [
@@ -42,13 +52,42 @@ _META = {
     'Date from', 'Date to', 'Date_from', 'Date_to',
     'Data Timeframe', 'Timeframe', 'timeframe',
     'GHG Category', 'GHG Sub Category',
-    'Volumetric Quantity', 'Volumetric_Quantity',
+    'Volumetric Quantity',
     'Data integrity', 'Estimation Method', 'Data Quality Score',
     'Month', 'Year', 'Financial Year', 'FY',
     'Scope', 'Functional Unit', 'Calculation Method',
     'Emission source', 'Meter Number',
     '_Timeframe', '_Month',
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 3: Popup error / warning helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _popup_error(title, message):
+    """Show a blocking error popup and raise ValueError. Falls back to console."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        print(f"\n{'='*60}\n  ERROR: {title}\n  {message}\n{'='*60}\n")
+    raise ValueError(f"{title}: {message}")
+
+
+def _popup_warning(title, message):
+    """Show a non-blocking warning popup. Falls back to console."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        messagebox.showwarning(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        print(f"\n{'='*60}\n  WARNING: {title}\n  {message}\n{'='*60}\n")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Date helpers
@@ -98,7 +137,7 @@ def _timeframe(date_from, date_to):
 # Feature scanning — used by GUI to populate feature selector
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
+def scan_features(filepath):
     """
     Scan a file and return feature candidates with quality scores.
     Returns list of dicts:
@@ -110,12 +149,7 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
         df = pd.read_excel(filepath, nrows=5000)
     df.columns = df.columns.str.strip()
 
-    # Find site and VQ cols to exclude
     skip = set(_META)
-    for cand in ['Site identifier', 'Site_identifier', 'Location', 'location',
-                 'Volumetric Quantity', 'Volumetric_Quantity', vq_col_hint]:
-        skip.add(cand)
-
     results = []
     n = len(df)
 
@@ -126,13 +160,12 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
         non_null = df[col].dropna()
         fill_pct = round(len(non_null) / n * 100, 1) if n > 0 else 0
         if fill_pct < 10 or len(non_null) < 4:
-            continue  # too sparse to be useful
+            continue
 
         unique_count = non_null.nunique()
 
         is_numeric = pd.api.types.is_numeric_dtype(df[col])
         if not is_numeric:
-            # Try coercing — strip commas and currency symbols first
             cleaned = non_null.astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip()
             conv = pd.to_numeric(cleaned, errors='coerce')
             if conv.notna().sum() / len(non_null) > 0.8:
@@ -143,14 +176,11 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
         if is_numeric:
             if unique_count < 2:
                 continue
-            # Coefficient of variation as variance score (capped 0–1)
             mean_val = non_null.mean()
             std_val  = non_null.std()
             cv = (std_val / mean_val) if mean_val != 0 else 0
             variance_score = round(min(float(cv), 1.0), 3)
             feat_type = 'Numeric'
-
-            # Recommendation logic
             if fill_pct >= 70 and variance_score >= 0.3 and unique_count >= 10:
                 recommended = True
                 reason = f'Good fill rate ({fill_pct}%), strong variance (CV={variance_score:.2f}), {unique_count} unique values'
@@ -161,17 +191,14 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
                 recommended = False
                 reason = (f'Low fill rate ({fill_pct}%)' if fill_pct < 50
                           else f'Low variance (CV={variance_score:.2f}) — little predictive signal')
-
         else:
             if unique_count < 2 or unique_count > 30:
                 continue
-            # For categoricals: score by how evenly distributed values are (entropy)
             counts = non_null.value_counts(normalize=True)
             entropy = float(-np.sum(counts * np.log2(counts + 1e-10)))
             max_entropy = np.log2(unique_count) if unique_count > 1 else 1
             variance_score = round(entropy / max_entropy, 3) if max_entropy > 0 else 0
             feat_type = 'Categorical'
-
             if fill_pct >= 70 and unique_count >= 2 and variance_score >= 0.5:
                 recommended = True
                 reason = f'Good fill ({fill_pct}%), {unique_count} categories, well-distributed (entropy={variance_score:.2f})'
@@ -184,16 +211,11 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
                           else f'Skewed distribution — one category dominates (entropy={variance_score:.2f})')
 
         results.append({
-            'name': col,
-            'type': feat_type,
-            'fill_pct': fill_pct,
-            'unique_count': unique_count,
-            'variance_score': variance_score,
-            'recommended': recommended,
-            'reason': reason,
+            'name': col, 'type': feat_type, 'fill_pct': fill_pct,
+            'unique_count': unique_count, 'variance_score': variance_score,
+            'recommended': recommended, 'reason': reason,
         })
 
-    # Sort: recommended first, then by variance_score desc
     results.sort(key=lambda x: (-int(x['recommended']), -x['variance_score']))
     return results
 
@@ -204,62 +226,45 @@ def scan_features(filepath, vq_col_hint='Volumetric Quantity'):
 
 def _pearson(x, y):
     m = np.isfinite(x) & np.isfinite(y)
-    if m.sum() < 4:
-        return None, None, None
+    if m.sum() < 4: return None, None, None
     try:
         r, p = stats.pearsonr(x[m], y[m])
         return float(r), float(r**2), float(p)
     except Exception:
         return None, None, None
 
-
 def _spearman(x, y):
     m = np.isfinite(x) & np.isfinite(y)
-    if m.sum() < 4:
-        return None, None, None
+    if m.sum() < 4: return None, None, None
     try:
         r, p = stats.spearmanr(x[m], y[m])
         return float(r), float(r**2), float(p)
     except Exception:
         return None, None, None
 
-
 def _kendall(x, y):
     m = np.isfinite(x) & np.isfinite(y)
-    if m.sum() < 4:
-        return None, None, None
+    if m.sum() < 4: return None, None, None
     try:
         tau, p = stats.kendalltau(x[m], y[m])
         return float(tau), float(tau**2), float(p)
     except Exception:
         return None, None, None
 
-
 def _pointbiserial(codes, y):
     m = np.isfinite(codes) & np.isfinite(y)
-    if m.sum() < 4 or len(np.unique(codes[m])) < 2:
-        return None, None, None
+    if m.sum() < 4 or len(np.unique(codes[m])) < 2: return None, None, None
     try:
         r, p = stats.pointbiserialr(codes[m], y[m])
         return float(r), float(r**2), float(p)
     except Exception:
         return None, None, None
 
-
 def _eff_r2(pr2, sr2, kr2=None, pbr2=None):
     cands = [v for v in (pr2, sr2, kr2, pbr2) if v is not None]
     return max(cands) if cands else 0.0
 
-
 def _cv_r2_with_meta(model, X, y, cv=5):
-    """
-    Returns (mean_r2, n_train, n_test_per_fold, n_folds, cv_type).
-
-    Note: LeaveOneOut with n<10 returns nan for mean_r2 — R² is mathematically
-    undefined when there is only 1 test point per fold. The models still train
-    and are used for predictions; the nan simply means CV evaluation is
-    not possible at this sample size.
-    """
     n = len(X)
     if n < 4:
         return float('nan'), n, 0, 0, 'insufficient'
@@ -271,8 +276,7 @@ def _cv_r2_with_meta(model, X, y, cv=5):
         k = min(cv, n // 2)
         kf = KFold(n_splits=k, shuffle=True, random_state=42)
         scores = cross_val_score(model, X, y, cv=kf, scoring='r2')
-        n_test = n // k
-        return float(np.mean(scores)), n, n_test, k, f'{k}-Fold'
+        return float(np.mean(scores)), n, n // k, k, f'{k}-Fold'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,16 +285,14 @@ def _cv_r2_with_meta(model, X, y, cv=5):
 
 class ExtrapolationTool:
 
+    # FIX 1: VQ column name is a class constant — always exact, never fuzzy
+    VQ_COL = 'Volumetric Quantity'
+
     def __init__(self, input_file,
                  historic_records_file=None,
                  historic_features_file=None,
                  forced_numeric_features=None,
                  forced_categorical_features=None):
-        """
-        forced_numeric_features / forced_categorical_features:
-            If provided (lists of column names), use these instead of auto-detection.
-            Supplied by the GUI feature selector.
-        """
         self.input_file = input_file
         self.historic_records_file = historic_records_file
         self.historic_features_file = historic_features_file
@@ -301,27 +303,31 @@ class ExtrapolationTool:
         self.known = None
         self.blank = None
 
-        self.site_col = None
-        self.vq_col = None
-        self.ghg_col = None          # GHG Category column if present
-        self.ghg_sub_col = None      # GHG Sub Category column if present
-        self.numeric_features = []
+        self.site_col    = None
+        self.vq_col      = self.VQ_COL   # always 'Volumetric Quantity'
+        self.ghg_col     = None          # FIX 2: REQUIRED
+        self.ghg_sub_col = None          # used when present
+
+        self.numeric_features     = []
         self.categorical_features = []
-        self.seasonal_patterns = {}          # cross-dataset {month: factor}
-        self.site_seasonal_patterns = {}     # per-site {composite_key: {month: factor}}
+
+        # FIX 2: seasonal patterns keyed by (ghg [, ghg_sub]) not just month
+        self.seasonal_patterns      = {}   # {(ghg[, sub]): {month: factor}}
+        self.site_seasonal_patterns = {}   # {(site, ghg[, sub]): {month: factor}}
+
         self._vq_lo = 0.0
         self._vq_hi = float('inf')
 
         self.stat_methods = {}
-        self.ml_models = {}
+        self.ml_models    = {}
         self.cat_breakdown = {}
 
-        self.historic_vq = {}            # {composite_key: {month_or_ANNUAL: vq}}
-        self.historic_growth_rates = {}  # {composite_key: annual_growth_rate}
-        self.historic_feats = {}         # {site: {feat: value}}  (site-level only)
+        self.historic_vq            = {}
+        self.historic_growth_rates  = {}
+        self.historic_feats         = {}
         self.historic_anchor_quality = {}
-        self.historic_year = None
-        self.current_year = None
+        self.historic_year  = None
+        self.current_year   = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -329,6 +335,7 @@ class ExtrapolationTool:
         print("=" * 60)
         print("LOADING DATA")
         print("=" * 60)
+
         if self.input_file.lower().endswith('.csv'):
             self.df = pd.read_csv(self.input_file)
         else:
@@ -336,31 +343,54 @@ class ExtrapolationTool:
         self.df.columns = self.df.columns.str.strip()
         print(f"  {len(self.df)} rows x {len(self.df.columns)} columns")
 
-        self.vq_col = self._col(['Volumetric Quantity', 'Volumetric_Quantity', 'VQ'])
-        if not self.vq_col:
-            raise ValueError("Cannot find 'Volumetric Quantity' column.")
+        # ── FIX 1: VQ column must be exactly 'Volumetric Quantity' ───────────
+        if self.VQ_COL not in self.df.columns:
+            _popup_error(
+                "Missing Column: Volumetric Quantity",
+                f"The input file must contain a column named exactly "
+                f"'Volumetric Quantity'.\n\n"
+                f"Columns found: {list(self.df.columns)}\n\n"
+                f"Please rename the column and re-run."
+            )
 
-        self.site_col = self._col(
-            ['Site identifier', 'Site_identifier', 'Site ID', 'SiteID'])
+        # ── FIX 2: GHG Category is REQUIRED ──────────────────────────────────
+        self.ghg_col = self._col(['GHG Category', 'GHG_Category', 'ghg_category'])
+        if not self.ghg_col:
+            _popup_error(
+                "Missing Column: GHG Category",
+                "The input file must contain a 'GHG Category' column.\n\n"
+                "GHG Category is required so that each emission type "
+                "(Electricity, Gas, Water, etc.) is predicted only from "
+                "data within the same category.\n\n"
+                "Please add this column and re-run."
+            )
+
+        self.ghg_sub_col = self._col(['GHG Sub Category', 'GHG_Sub_Category'])
+
+        # ── Site column ───────────────────────────────────────────────────────
+        self.site_col = self._col(['Site identifier', 'Site_identifier', 'Site ID', 'SiteID'])
         if not self.site_col:
             self.site_col = self._col(['Location', 'location', 'Site Name'])
             if self.site_col:
-                print(f"  Using '{self.site_col}' as site key (no Site identifier found)")
+                print(f"  Using '{self.site_col}' as site key")
             else:
-                raise ValueError("Cannot find site identifier or location column.")
+                _popup_error(
+                    "Missing Column: Site Identifier",
+                    "Cannot find a site identifier or location column.\n\n"
+                    "Expected one of: 'Site identifier', 'Location', 'Site Name'."
+                )
 
+        # ── FIX 3: Date columns validated before anything else ────────────────
+        self._validate_date_columns()
         self._add_timeframe_cols()
         self._coerce_numeric()
-        self._detect_features()
 
-        # Detect GHG category columns — used as part of composite key
-        self.ghg_col     = self._col(['GHG Category', 'GHG_Category', 'ghg_category'])
-        self.ghg_sub_col = self._col(['GHG Sub Category', 'GHG_Sub_Category'])
-        if self.ghg_col:
-            cats = self.df[self.ghg_col].dropna().unique()
-            print(f"  GHG categories found: {list(cats)}")
-            print(f"  Predictions will be keyed on Site + GHG Category"
-                  + (" + GHG Sub Category" if self.ghg_sub_col else ""))
+        cats = self.df[self.ghg_col].dropna().unique()
+        print(f"  GHG categories found: {list(cats)}")
+        print(f"  Predictions keyed on: Site + GHG Category"
+              + (" + GHG Sub Category" if self.ghg_sub_col else ""))
+
+        self._detect_features()
 
         self.known = self.df[self.df[self.vq_col].notna()].copy()
         self.blank = self.df[self.df[self.vq_col].isna()].copy()
@@ -380,6 +410,51 @@ class ExtrapolationTool:
             self._load_historic_features()
         return self
 
+    # ── FIX 3: Date validation ────────────────────────────────────────────────
+
+    def _validate_date_columns(self):
+        """Popup errors for missing or unparseable date columns."""
+        from_col = self._col(['Date from', 'Date_from'])
+        to_col   = self._col(['Date to',   'Date_to'])
+
+        if not from_col:
+            _popup_error(
+                "Missing Column: Date from",
+                "The input file must contain a 'Date from' column.\n\n"
+                "This is required to classify rows as Monthly or Annual "
+                "and to align historic data with the correct year.\n\n"
+                "Please add this column (format: DD/MM/YYYY) and re-run."
+            )
+        if not to_col:
+            _popup_error(
+                "Missing Column: Date to",
+                "The input file must contain a 'Date to' column.\n\n"
+                "Required alongside 'Date from' to determine timeframe.\n\n"
+                "Please add this column (format: DD/MM/YYYY) and re-run."
+            )
+
+        for col_label, col in [('Date from', from_col), ('Date to', to_col)]:
+            sample = self.df[col].dropna().head(50)
+            if len(sample) == 0:
+                _popup_error(
+                    f"Empty Column: {col_label}",
+                    f"'{col_label}' exists but contains no values.\n\n"
+                    f"Please populate this column and re-run."
+                )
+            failed = [v for v in sample if _parse_date(v) is None]
+            if failed:
+                examples = ', '.join(str(v) for v in failed[:5])
+                _popup_error(
+                    f"Unparseable Dates: {col_label}",
+                    f"Some values in '{col_label}' could not be parsed as dates.\n\n"
+                    f"Examples: {examples}\n\n"
+                    f"Supported formats: DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY, "
+                    f"DD/MM/YY, DD Mon YYYY.\n\n"
+                    f"Please fix these and re-run."
+                )
+
+        print(f"  Date columns validated: '{from_col}', '{to_col}'")
+
     def _col(self, candidates):
         low = {c.lower().strip(): c for c in self.df.columns}
         for c in candidates:
@@ -391,31 +466,22 @@ class ExtrapolationTool:
 
     def _composite_key(self, row_or_site, ghg=None, ghg_sub=None):
         """
-        Build a composite lookup key: (site, ghg_category [, ghg_sub_category]).
-
-        GHG Sub Category is only included in the key when it is actually populated
-        on this row. This means:
-          - Waste / Water  →  (site, 'Waste', 'Water')   ← specific match only
-          - Waste / (blank) → (site, 'Waste')             ← never matches Water rows
-        So a blank-sub prediction won't accidentally borrow from a sub-categorised
-        historic entry, and vice versa.
-
-        Accepts either a dict/Series row (then extracts cols automatically)
-        or explicit string values.
+        Build composite lookup key: (site, ghg [, ghg_sub]).
+        GHG Category is always present in the main file (enforced above).
+        GHG Sub Category only included when populated on this row.
         """
         _BLANK = {'', 'nan', 'none', 'n/a', '-'}
 
         if isinstance(row_or_site, (dict, pd.Series)):
             row     = row_or_site
             site    = str(row.get(self.site_col, '') or '').strip()
-            ghg     = str(row.get(self.ghg_col,     '') or '').strip() if self.ghg_col     else ''
+            ghg     = str(row.get(self.ghg_col,     '') or '').strip()
             ghg_sub = str(row.get(self.ghg_sub_col, '') or '').strip() if self.ghg_sub_col else ''
         else:
             site    = str(row_or_site or '').strip()
             ghg     = str(ghg     or '').strip()
             ghg_sub = str(ghg_sub or '').strip()
 
-        # Normalise: treat blanks, 'nan', 'None', 'N/A' as absent
         if ghg.lower()     in _BLANK: ghg     = ''
         if ghg_sub.lower() in _BLANK: ghg_sub = ''
 
@@ -428,7 +494,7 @@ class ExtrapolationTool:
 
     def _add_timeframe_cols(self):
         from_col = self._col(['Date from', 'Date_from'])
-        to_col   = self._col(['Date to', 'Date_to'])
+        to_col   = self._col(['Date to',   'Date_to'])
         fs = self.df[from_col] if from_col else pd.Series([None]*len(self.df))
         ts = self.df[to_col]   if to_col   else pd.Series([None]*len(self.df))
         tfs, mos = [], []
@@ -437,7 +503,7 @@ class ExtrapolationTool:
             tfs.append(tf)
             mos.append(mo or '')
         self.df['_Timeframe'] = tfs
-        self.df['_Month'] = mos
+        self.df['_Month']     = mos
         print(f"  Timeframes: {pd.Series(tfs).value_counts().to_dict()}")
 
     def _coerce_numeric(self):
@@ -453,27 +519,19 @@ class ExtrapolationTool:
             non_null = self.df[col].dropna()
             if not len(non_null):
                 continue
-
-            # Strip commas and currency symbols before attempting conversion
-            # e.g. "20,000" → "20000", "£1,234.56" → "1234.56"
             cleaned = non_null.astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip()
-            conv = pd.to_numeric(cleaned, errors='coerce')
-            rate = conv.notna().sum() / len(non_null)
-            hint = any(h in col.lower() for h in hints)
-
-            # Apply if: named like a numeric feature AND mostly converts,
-            # OR: no hint needed if conversion is near-perfect (>95%) — catches
-            # any numeric column regardless of name
+            conv    = pd.to_numeric(cleaned, errors='coerce')
+            rate    = conv.notna().sum() / len(non_null)
+            hint    = any(h in col.lower() for h in hints)
             if (rate > 0.8 and hint) or rate > 0.95:
                 self.df[col] = pd.to_numeric(
                     self.df[col].astype(str).str.replace(r'[,£$€]', '', regex=True).str.strip(),
                     errors='coerce'
                 )
                 if rate > 0.8 and hint:
-                    print(f"  Coerced '{col}' to numeric (comma/symbol stripped, {rate:.0%} convertible)")
+                    print(f"  Coerced '{col}' to numeric ({rate:.0%} convertible)")
 
     def _detect_features(self):
-        # If the GUI has provided explicit feature lists, honour them
         if self.forced_numeric_features is not None or self.forced_categorical_features is not None:
             self.numeric_features     = list(self.forced_numeric_features or [])
             self.categorical_features = list(self.forced_categorical_features or [])
@@ -482,8 +540,7 @@ class ExtrapolationTool:
             return
 
         skip = _META | {self.site_col, self.vq_col}
-        self.numeric_features = []
-        self.categorical_features = []
+        self.numeric_features, self.categorical_features = [], []
         for col in self.df.columns:
             if col in skip or col.startswith('_'):
                 continue
@@ -492,14 +549,43 @@ class ExtrapolationTool:
                 continue
             if pd.api.types.is_numeric_dtype(self.df[col]) and nn.nunique() > 1:
                 self.numeric_features.append(col)
-            elif not pd.api.types.is_numeric_dtype(self.df[col]):
-                u = nn.nunique()
-                if 2 <= u <= 30:
-                    self.categorical_features.append(col)
-        print(f"  Numeric features (auto):     {self.numeric_features}")
-        print(f"  Categorical features (auto): {self.categorical_features}")
+            elif not pd.api.types.is_numeric_dtype(self.df[col]) and 2 <= nn.nunique() <= 30:
+                self.categorical_features.append(col)
 
-    # ── Historic ──────────────────────────────────────────────────────────────
+        print(f"  Numeric features (auto):       {self.numeric_features}")
+        print(f"  Categorical features (auto):   {self.categorical_features}")
+
+    # ── GHG filter helpers ────────────────────────────────────────────────────
+
+    def _filter_to_ghg(self, df_in, ghg_val, ghg_sub_val=None):
+        """
+        FIX 2: Filter df to rows matching ghg_val (and ghg_sub_val if provided).
+        All stat tests and ML training call this before using any data.
+        """
+        mask = df_in[self.ghg_col].astype(str).str.strip() == str(ghg_val).strip()
+        result = df_in[mask]
+        if (self.ghg_sub_col and ghg_sub_val is not None
+                and str(ghg_sub_val).strip().lower() not in ('', 'nan', 'none', 'n/a', '-')):
+            sub_mask = result[self.ghg_sub_col].astype(str).str.strip() == str(ghg_sub_val).strip()
+            result = result[sub_mask]
+        return result
+
+    def _unique_ghg_combos(self, df_in):
+        """List of (ghg, ghg_sub_or_None) tuples present in df_in."""
+        cols = [self.ghg_col] + ([self.ghg_sub_col] if self.ghg_sub_col else [])
+        combos = set()
+        for _, row in df_in[cols].drop_duplicates().iterrows():
+            ghg = str(row[self.ghg_col]).strip() if pd.notna(row[self.ghg_col]) else ''
+            sub = None
+            if self.ghg_sub_col:
+                raw = row.get(self.ghg_sub_col)
+                if pd.notna(raw) and str(raw).strip().lower() not in ('', 'nan', 'none', 'n/a', '-'):
+                    sub = str(raw).strip()
+            if ghg:
+                combos.add((ghg, sub))
+        return sorted(combos, key=lambda x: (x[0], x[1] or ''))
+
+    # ── Historic loading ──────────────────────────────────────────────────────
 
     def _load_historic_records(self):
         print("\n  Loading historic records...")
@@ -511,21 +597,46 @@ class ExtrapolationTool:
 
             scol = next((c for c in ['Site identifier', 'Site_identifier', 'Location']
                          if c in hrec.columns), None)
-            vcol = next((c for c in hrec.columns if 'volumetric' in c.lower()), None)
-            if not scol or not vcol:
-                print("  ⚠  Missing site or VQ column in historic records")
-                return
+            if not scol:
+                _popup_error(
+                    "Missing Column in Historic Records: Site Identifier",
+                    "Historic records file must have a site identifier column "
+                    "('Site identifier' or 'Location')."
+                )
 
-            from_col      = next((c for c in hrec.columns if 'date from' in c.lower() or c.lower() == 'date_from'), None)
-            to_col        = next((c for c in hrec.columns if 'date to'   in c.lower() or c.lower() == 'date_to'),   None)
-            integrity_col = next((c for c in hrec.columns if 'data integrity' in c.lower() or c.lower() == 'integrity'), None)
+            # FIX 1: VQ column must be 'Volumetric Quantity' in historic file too
+            if self.VQ_COL not in hrec.columns:
+                _popup_error(
+                    "Missing Column in Historic Records: Volumetric Quantity",
+                    f"Historic records file must contain 'Volumetric Quantity'.\n\n"
+                    f"Columns found: {list(hrec.columns)}"
+                )
+            vcol = self.VQ_COL
+
+            from_col      = next((c for c in hrec.columns if 'date from' in c.lower()), None)
+            to_col        = next((c for c in hrec.columns if 'date to'   in c.lower()), None)
+            integrity_col = next((c for c in hrec.columns if 'data integrity' in c.lower()), None)
             h_ghg_col     = next((c for c in hrec.columns if c.lower() in ('ghg category', 'ghg_category')), None)
             h_ghgsub_col  = next((c for c in hrec.columns if c.lower() in ('ghg sub category', 'ghg_sub_category')), None)
 
-            # Collect all rows keyed by (composite_key, month_or_ANNUAL, year)
-            # so we can handle multiple years properly
-            # Structure: raw_rows[(ckey, period)] = [(year, vq, integrity), ...]
-            from collections import defaultdict
+            # FIX 3: Warn if historic file missing date or GHG columns
+            if not from_col:
+                _popup_warning(
+                    "Missing Date Column in Historic Records",
+                    "Historic records file has no 'Date from' column.\n\n"
+                    "Rows cannot be assigned to a year — growth rate projection "
+                    "and historic_year detection will not be available.\n\n"
+                    "Historic VQ will still be loaded for direct matching."
+                )
+            if not h_ghg_col:
+                _popup_warning(
+                    "Missing GHG Category in Historic Records",
+                    "Historic records file has no 'GHG Category' column.\n\n"
+                    "Data will be matched on site identifier only, which may "
+                    "cause cross-category contamination. It is strongly recommended "
+                    "to add a GHG Category column."
+                )
+
             raw_rows = defaultdict(list)
             years_seen = set()
             historic_integrity = {}
@@ -550,7 +661,6 @@ class ExtrapolationTool:
                     iv = row.get(integrity_col)
                     integ = str(iv).strip() if pd.notna(iv) else None
 
-                # Build composite key matching the same logic as the main file
                 ghg     = str(row.get(h_ghg_col,    '')).strip() if h_ghg_col    else ''
                 ghg_sub = str(row.get(h_ghgsub_col, '')).strip() if h_ghgsub_col else ''
                 if ghg and ghg_sub and self.ghg_sub_col:
@@ -562,7 +672,6 @@ class ExtrapolationTool:
 
                 raw_rows[(ckey, period)].append((year, float(vq), integ))
 
-            # ── Determine current year range ──────────────────────────────────
             curr_yrs = set()
             fc = self._col(['Date from', 'Date_from'])
             if fc:
@@ -574,47 +683,35 @@ class ExtrapolationTool:
             if past_yrs:
                 self.historic_year = max(past_yrs)
 
-            # ── For each composite key + period: pick most recent year ────────
-            # Also compute growth rate if multiple years available
-            # growth_rates[(ckey)] = avg annual % change across all periods
-            growth_accumulator = defaultdict(list)  # ckey -> [yoy_ratios]
+            growth_accumulator = defaultdict(list)
 
             for (ckey, period), year_rows in raw_rows.items():
-                # Sort by year
                 year_rows_sorted = sorted(
-                    [(y, vq, integ) for y, vq, integ in year_rows if y is not None],
-                    key=lambda x: x[0]
-                )
-                no_year = [(y, vq, integ) for y, vq, integ in year_rows if y is None]
+                    [(y, vq, ig) for y, vq, ig in year_rows if y is not None],
+                    key=lambda x: x[0])
+                no_year = [(y, vq, ig) for y, vq, ig in year_rows if y is None]
 
                 if year_rows_sorted:
-                    # Most recent year wins as anchor
                     _, best_vq, best_integ = year_rows_sorted[-1]
                     self.historic_vq.setdefault(ckey, {})[period] = best_vq
-
                     if best_integ:
                         historic_integrity.setdefault(ckey, {})[period] = best_integ
-
-                    # Compute year-on-year growth ratios for this period
                     for i in range(1, len(year_rows_sorted)):
                         y0, vq0, _ = year_rows_sorted[i-1]
                         y1, vq1, _ = year_rows_sorted[i]
                         yr_gap = y1 - y0
                         if yr_gap > 0 and vq0 > 0 and vq1 > 0:
-                            annual_ratio = (vq1 / vq0) ** (1.0 / yr_gap)
-                            growth_accumulator[ckey].append(annual_ratio)
+                            growth_accumulator[ckey].append((vq1 / vq0) ** (1.0 / yr_gap))
                 elif no_year:
                     _, best_vq, best_integ = no_year[-1]
                     self.historic_vq.setdefault(ckey, {})[period] = best_vq
                     if best_integ:
                         historic_integrity.setdefault(ckey, {})[period] = best_integ
 
-            # ── Compute per-key growth rate (median of all period ratios) ──────
             for ckey, ratios in growth_accumulator.items():
                 if ratios:
                     self.historic_growth_rates[ckey] = float(np.median(ratios))
 
-            # ── Anchor quality (informational only — no longer gates selection) ─
             self.historic_anchor_quality = {}
             for ckey in self.historic_vq:
                 if not integrity_col or ckey not in historic_integrity:
@@ -628,19 +725,19 @@ class ExtrapolationTool:
                     n_actual = sum(1 for v in site_integ.values() if v and v.lower() == 'actual')
                     self.historic_anchor_quality[ckey] = 'good' if n_actual >= 3 else 'poor'
 
-            n_keys_with_growth = len(self.historic_growth_rates)
-            n_multi_year = sum(1 for ratios in growth_accumulator.values() if ratios)
-            print(f"  Historic records: {len(self.historic_vq)} site+category keys, "
-                  f"year={self.historic_year}")
+            n_growth = len(self.historic_growth_rates)
+            print(f"  Historic records: {len(self.historic_vq)} keys, year={self.historic_year}")
             print(f"  Years in historic file: {sorted(years_seen)}")
-            if n_multi_year:
-                print(f"  Multi-year growth rates computed for {n_keys_with_growth} keys "
-                      f"(used to project forward)")
+            if n_growth:
+                print(f"  Growth rates computed for {n_growth} keys")
 
+        except ValueError:
+            raise
         except Exception as e:
             import traceback
             print(f"  ⚠  Historic records error: {e}")
             traceback.print_exc()
+
     def _load_historic_features(self):
         print("  Loading historic features...")
         try:
@@ -651,8 +748,24 @@ class ExtrapolationTool:
             scol = next((c for c in ['Site identifier', 'Site_identifier', 'Location']
                          if c in hf.columns), None)
             if not scol:
+                _popup_error(
+                    "Missing Column in Historic Features: Site Identifier",
+                    "Historic features file must have a site identifier column."
+                )
+
+            _GHG_COLS = {'GHG Category', 'GHG_Category', 'ghg_category',
+                         'GHG Sub Category', 'GHG_Sub_Category'}
+            skip_cols = _META | _GHG_COLS | {scol}
+            feat_cols = [c for c in hf.columns if c not in skip_cols]
+
+            if not feat_cols:
+                _popup_warning(
+                    "No Feature Columns in Historic Features File",
+                    "No usable feature columns found after excluding metadata.\n\n"
+                    "Historic feature adjustment will not be available."
+                )
                 return
-            feat_cols = [c for c in hf.columns if c not in _META and c != scol]
+
             for _, row in hf.iterrows():
                 site = row.get(scol)
                 if pd.isna(site):
@@ -666,7 +779,10 @@ class ExtrapolationTool:
                             self.historic_feats[site][fc] = float(v)
                         except Exception:
                             self.historic_feats[site][fc] = v
-            print(f"  Historic features: {len(self.historic_feats)} sites")
+
+            print(f"  Historic features: {len(self.historic_feats)} sites, columns: {feat_cols}")
+        except ValueError:
+            raise
         except Exception as e:
             print(f"  ⚠  Historic features error: {e}")
 
@@ -674,256 +790,242 @@ class ExtrapolationTool:
 
     def _calc_seasonal(self):
         """
-        Compute two levels of seasonal index:
-          self.seasonal_patterns        — cross-dataset (all sites, all months)
-          self.site_seasonal_patterns   — per-site where site has >=3 known months
-
-        Index meaning: Jan=1.06 means January is typically 6% above that site's average.
-        Applied at prediction time as: anchor × index[month].
+        FIX 2: Seasonal indices computed per GHG category, not across all categories.
+        self.seasonal_patterns keyed on (ghg [, ghg_sub]): {month: factor}
+        self.site_seasonal_patterns keyed on (site, ghg [, ghg_sub]): {month: factor}
         """
         mo = self.known[self.known['_Timeframe'] == 'Monthly']
         if len(mo) < 4:
             return
 
-        # Cross-dataset index
-        avgs = mo.groupby('_Month')[self.vq_col].mean()
-        overall = avgs.mean()
-        if overall > 0:
-            self.seasonal_patterns = {m: float(v / overall) for m, v in avgs.items()}
-
-        # Per-site index (only for sites with >=3 months of data)
+        self.seasonal_patterns      = {}
         self.site_seasonal_patterns = {}
-        for site, grp in mo.groupby(self.site_col):
-            if grp['_Month'].nunique() < 3:
+
+        for ghg, ghg_sub in self._unique_ghg_combos(mo):
+            cat_mo  = self._filter_to_ghg(mo, ghg, ghg_sub)
+            cat_key = (ghg, ghg_sub) if ghg_sub else (ghg,)
+            if len(cat_mo) < 4:
                 continue
-            site_avgs = grp.groupby('_Month')[self.vq_col].mean()
-            site_overall = site_avgs.mean()
-            if site_overall > 0:
-                self.site_seasonal_patterns[str(site).strip()] = {
-                    m: float(v / site_overall) for m, v in site_avgs.items()
-                }
 
-        print(f"  Seasonal index: cross-dataset ({len(self.seasonal_patterns)} months), "
-              f"per-site ({len(self.site_seasonal_patterns)} sites)")
+            avgs    = cat_mo.groupby('_Month')[self.vq_col].mean()
+            overall = avgs.mean()
+            if overall > 0:
+                self.seasonal_patterns[cat_key] = {m: float(v / overall) for m, v in avgs.items()}
 
-    def _seasonal_factor(self, site, month):
-        """Return the best available seasonal factor for this site+month."""
+            for site, grp in cat_mo.groupby(self.site_col):
+                if grp['_Month'].nunique() < 3:
+                    continue
+                site_avgs    = grp.groupby('_Month')[self.vq_col].mean()
+                site_overall = site_avgs.mean()
+                if site_overall > 0:
+                    sk = (str(site).strip(),) + cat_key
+                    self.site_seasonal_patterns[sk] = {
+                        m: float(v / site_overall) for m, v in site_avgs.items()}
+
+        print(f"  Seasonal index: {len(self.seasonal_patterns)} GHG categories, "
+              f"{len(self.site_seasonal_patterns)} site+category combos")
+
+    def _seasonal_factor(self, site, month, ghg=None, ghg_sub=None):
         if not month:
             return 1.0
-        # Prefer site-specific index if available for this month
-        site_idx = self.site_seasonal_patterns.get(site, {})
+        cat_key      = (ghg, ghg_sub) if ghg_sub else (ghg,) if ghg else ()
+        site_cat_key = (site,) + cat_key if cat_key else (site,)
+        site_idx = self.site_seasonal_patterns.get(site_cat_key, {})
         if month in site_idx:
             return site_idx[month]
-        # Fall back to cross-dataset
-        return self.seasonal_patterns.get(month, 1.0)
+        return self.seasonal_patterns.get(cat_key, {}).get(month, 1.0)
 
     def _sanity_bounds(self):
-        """
-        Compute dataset-wide VQ bounds for sanity-checking predictions.
-        Lower: 0 (never negative)
-        Upper: 3× the 99th percentile of all known VQ values
-        """
         vq_vals = self.known[self.vq_col].dropna().values
         if len(vq_vals) == 0:
             return 0.0, float('inf')
-        p99 = float(np.percentile(vq_vals, 99))
-        return 0.0, p99 * 3.0
+        return 0.0, float(np.percentile(vq_vals, 99)) * 3.0
 
     def _clip(self, value, lo, hi):
-        """Clip a prediction to sanity bounds. Returns None if value is non-finite."""
         if value is None or not np.isfinite(value):
             return None
         if value < lo:
-            return None   # negatives → reject, don't clip to 0 silently
+            return None
         return min(value, hi)
 
     # ── Statistical tests ─────────────────────────────────────────────────────
 
     def run_statistical_tests(self):
+        """
+        FIX 2: All methods computed per GHG category. Method names prefixed
+        with '<GHG>[__<Sub>]__' to ensure predictions only use same-category stats.
+        """
         print("\n" + "=" * 60)
         print("STATISTICAL ANALYSIS")
         print("=" * 60)
         self._calc_seasonal()
-        mn = self.known[self.known['_Timeframe'] == 'Monthly']
-        an = self.known[self.known['_Timeframe'] == 'Annual']
 
-        # 1 – Site average (monthly)
-        if len(mn) >= 4:
-            sa = mn.groupby(self.site_col)[self.vq_col].mean()
-            preds = mn[self.site_col].map(sa).fillna(sa.mean()).values.astype(float)
-            acts  = mn[self.vq_col].values.astype(float)
-            pr, pr2, pp = _pearson(preds, acts)
-            sr, sr2, sp = _spearman(preds, acts)
-            kr, kr2, kp = _kendall(preds, acts)
-            eff = _eff_r2(pr2, sr2, kr2)
-            self._reg('Site_Average',
-                      'Site average VQ across all known monthly rows',
-                      f'{len(mn)} monthly rows',
-                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                      _site_avgs=sa.to_dict())
+        for ghg, ghg_sub in self._unique_ghg_combos(self.known):
+            pfx       = ghg + (f'__{ghg_sub}' if ghg_sub else '') + '__'
+            cat_known = self._filter_to_ghg(self.known, ghg, ghg_sub)
+            mn        = cat_known[cat_known['_Timeframe'] == 'Monthly']
+            an        = cat_known[cat_known['_Timeframe'] == 'Annual']
+            cat_key   = (ghg, ghg_sub) if ghg_sub else (ghg,)
+            cat_sea   = self.seasonal_patterns.get(cat_key, {})
 
-        # 2 – Site average x seasonal
-        if len(mn) >= 4 and self.seasonal_patterns:
-            sa2  = mn.groupby(self.site_col)[self.vq_col].mean().to_dict()
-            fall = mn[self.vq_col].mean()
-            preds2 = []
-            for _, row in mn.iterrows():
-                avg = sa2.get(row[self.site_col], fall)
-                sf  = self.seasonal_patterns.get(row['_Month'], 1.0)
-                preds2.append(avg * sf)
-            p2 = np.array(preds2, float)
-            a2 = mn[self.vq_col].values.astype(float)
-            pr, pr2, pp = _pearson(p2, a2)
-            sr, sr2, sp = _spearman(p2, a2)
-            kr, kr2, kp = _kendall(p2, a2)
-            eff = _eff_r2(pr2, sr2, kr2)
-            self._reg('Site_Average_Seasonal',
-                      'Site average VQ scaled by monthly seasonal factor',
-                      f'{len(mn)} monthly rows',
-                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                      _site_avgs=sa2, _seasonal=True)
-
-        # 3 – Cross-site seasonal average
-        if len(mn) >= 4 and self.seasonal_patterns:
-            ma   = mn.groupby('_Month')[self.vq_col].mean().to_dict()
-            preds3 = [ma.get(row['_Month']) for _, row in mn.iterrows()]
-            p3 = np.array([v for v in preds3 if v is not None], float)
-            a3 = mn[self.vq_col].values[:len(p3)].astype(float)
-            pr, pr2, pp = _pearson(p3, a3)
-            sr, sr2, sp = _spearman(p3, a3)
-            kr, kr2, kp = _kendall(p3, a3)
-            eff = _eff_r2(pr2, sr2, kr2)
-            self._reg('Seasonal_Average',
-                      'Cross-site mean VQ per calendar month',
-                      f'{len(mn)} monthly rows',
-                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                      _month_avgs=ma)
-
-        # 4 – Overall average fallback
-        for sub, lbl in [(self.known, 'all'), (an, 'annual')]:
-            if len(sub) >= 4:
-                avg = float(sub[self.vq_col].mean())
-                self._reg(f'Overall_Average_{lbl}',
-                          f'Overall mean of {lbl} VQ values',
-                          f'{len(sub)} rows',
-                          None, None, None, None, None, None, None, None, None, None,
-                          None, None, None, 0.0,
-                          _avg=avg)
-                break
-
-        # 5 – Numeric feature intensity
-        for feat in self.numeric_features:
-            pool = self.known[self.known[feat].notna()]
-            if len(pool) < 4:
+            if len(cat_known) < 4:
                 continue
-            vq = pool[self.vq_col].values.astype(float)
-            fv = pool[feat].values.astype(float)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                ratios = np.where(fv > 0, vq / fv, np.nan)
-            slope = float(np.nanmedian(ratios)) if np.any(np.isfinite(ratios)) else None
-            pr, pr2, pp = _pearson(fv, vq)
-            sr, sr2, sp = _spearman(fv, vq)
-            kr, kr2, kp = _kendall(fv, vq)
-            eff = _eff_r2(pr2, sr2, kr2)
-            self._reg(f'Intensity_{feat}',
-                      f'VQ proportional to {feat} (median intensity slope)',
-                      f'{len(pool)} rows with {feat} + VQ',
-                      slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                      _feat=feat, _mtype='Feature_Intensity')
 
-            pm = pool[pool['_Timeframe'] == 'Monthly']
-            if len(pm) >= 4 and self.seasonal_patterns and slope:
-                preds_s, acts_s = [], []
-                for _, row in pm.iterrows():
-                    sf = self.seasonal_patterns.get(row['_Month'], 1.0)
-                    preds_s.append(float(row[feat]) * slope * sf)
-                    acts_s.append(row[self.vq_col])
-                if len(preds_s) >= 4:
-                    ps  = np.array(preds_s, float)
-                    as_ = np.array(acts_s, float)
-                    pr, pr2, pp = _pearson(ps, as_)
-                    sr, sr2, sp = _spearman(ps, as_)
-                    kr, kr2, kp = _kendall(ps, as_)
-                    eff = _eff_r2(pr2, sr2, kr2)
-                    self._reg(f'Intensity_{feat}_Seasonal',
-                              f'VQ ~ {feat} intensity x seasonal factor',
-                              f'{len(preds_s)} monthly rows with {feat}',
-                              slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                              _feat=feat, _mtype='Feature_Intensity_Seasonal', _seasonal=True)
+            label = ghg + (f' / {ghg_sub}' if ghg_sub else '')
+            print(f"  [{label}] {len(cat_known)} rows ({len(mn)} monthly, {len(an)} annual)")
 
-        # 6 – Categorical features (point-biserial)
-        for feat in self.categorical_features:
-            pool = self.known[self.known[feat].notna()]
-            if len(pool) < 4:
-                continue
-            vq    = pool[self.vq_col].values.astype(float)
-            codes = pd.Categorical(pool[feat]).codes.astype(float)
-            pbr, pbr2, pbp = _pointbiserial(codes, vq)
-            eff = _eff_r2(None, None, pbr2=pbr2)
-            cat_means = pool.groupby(feat)[self.vq_col].mean().to_dict()
-            self._reg(f'Categorical_{feat}',
-                      f'Group mean VQ by {feat}',
-                      f'{len(pool)} rows grouped by {feat}',
-                      None, None, None, None, None, None, None, None, None, None,
-                      pbr, pbr2, pbp, eff,
-                      _feat=feat, _mtype='Categorical', _cat_means=cat_means)
+            # 1 – Site average
+            if len(mn) >= 4:
+                sa    = mn.groupby(self.site_col)[self.vq_col].mean()
+                preds = mn[self.site_col].map(sa).fillna(sa.mean()).values.astype(float)
+                acts  = mn[self.vq_col].values.astype(float)
+                pr, pr2, pp = _pearson(preds, acts)
+                sr, sr2, sp = _spearman(preds, acts)
+                kr, kr2, kp = _kendall(preds, acts)
+                self._reg(f'{pfx}Site_Average',
+                          f'[{label}] Site average VQ (monthly)',
+                          f'{len(mn)} monthly rows',
+                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                          _eff_r2(pr2, sr2, kr2),
+                          _site_avgs=sa.to_dict(), _ghg=ghg, _ghg_sub=ghg_sub)
 
-        # 7 – Historic-adjusted
-        if self.historic_vq:
+            # 2 – Site average x seasonal
+            if len(mn) >= 4 and cat_sea:
+                sa2  = mn.groupby(self.site_col)[self.vq_col].mean().to_dict()
+                fall = mn[self.vq_col].mean()
+                p2   = np.array([sa2.get(r[self.site_col], fall) * cat_sea.get(r['_Month'], 1.0)
+                                 for _, r in mn.iterrows()], float)
+                a2   = mn[self.vq_col].values.astype(float)
+                pr, pr2, pp = _pearson(p2, a2); sr, sr2, sp = _spearman(p2, a2); kr, kr2, kp = _kendall(p2, a2)
+                self._reg(f'{pfx}Site_Average_Seasonal',
+                          f'[{label}] Site average x seasonal factor',
+                          f'{len(mn)} monthly rows',
+                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                          _eff_r2(pr2, sr2, kr2),
+                          _site_avgs=sa2, _seasonal=True, _ghg=ghg, _ghg_sub=ghg_sub)
+
+            # 3 – Cross-site seasonal average
+            if len(mn) >= 4 and cat_sea:
+                ma     = mn.groupby('_Month')[self.vq_col].mean().to_dict()
+                preds3 = [ma.get(r['_Month']) for _, r in mn.iterrows()]
+                p3 = np.array([v for v in preds3 if v is not None], float)
+                a3 = mn[self.vq_col].values[:len(p3)].astype(float)
+                pr, pr2, pp = _pearson(p3, a3); sr, sr2, sp = _spearman(p3, a3); kr, kr2, kp = _kendall(p3, a3)
+                self._reg(f'{pfx}Seasonal_Average',
+                          f'[{label}] Cross-site mean VQ per month',
+                          f'{len(mn)} monthly rows',
+                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                          _eff_r2(pr2, sr2, kr2),
+                          _month_avgs=ma, _ghg=ghg, _ghg_sub=ghg_sub)
+
+            # 4 – Overall average fallback
+            for sub, lbl in [(cat_known, 'all'), (an, 'annual')]:
+                if len(sub) >= 4:
+                    self._reg(f'{pfx}Overall_Average_{lbl}',
+                              f'[{label}] Overall mean {lbl} VQ',
+                              f'{len(sub)} rows',
+                              None, None, None, None, None, None, None, None, None, None,
+                              None, None, None, 0.0,
+                              _avg=float(sub[self.vq_col].mean()), _ghg=ghg, _ghg_sub=ghg_sub)
+                    break
+
+            # 5 – Feature intensity
             for feat in self.numeric_features:
-                preds_h, acts_h = [], []
-                for _, row in mn.iterrows():
-                    site  = str(row.get(self.site_col, '')).strip()
-                    month = row['_Month']
-                    cf    = row.get(feat)
-                    if pd.isna(cf) or not month:
-                        continue
-                    ckey = self._composite_key(row)
-                    hvq = self.historic_vq.get(ckey, {}).get(month)
-                    if hvq is None:
-                        ha = self.historic_vq.get(ckey, {}).get('ANNUAL')
-                        if ha:
-                            hvq = (ha/12) * self.seasonal_patterns.get(month, 1.0)
-                    if hvq is None:
-                        continue
-                    hf = self.historic_feats.get(site, {}).get(feat)
-                    if hf and float(hf) != 0:
-                        preds_h.append(hvq * (float(cf)/float(hf)))
-                        acts_h.append(row[self.vq_col])
-                if len(preds_h) >= 4:
-                    ph = np.array(preds_h, float)
-                    ah = np.array(acts_h, float)
-                    pr, pr2, pp = _pearson(ph, ah)
-                    sr, sr2, sp = _spearman(ph, ah)
-                    kr, kr2, kp = _kendall(ph, ah)
-                    eff = _eff_r2(pr2, sr2, kr2)
-                    self._reg(f'Historic_Adjusted_{feat}',
-                              f'Historic VQ x (current {feat} / historic {feat})',
-                              f'{len(preds_h)} rows with historic VQ + {feat}',
-                              None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                              _feat=feat, _mtype='Historic_Adjusted')
-
-            # Last-year direct
-            pl, al = [], []
-            for _, row in mn.iterrows():
-                month = row['_Month']
-                ckey  = self._composite_key(row)
-                hvq   = self.historic_vq.get(ckey, {}).get(month)
-                if hvq is not None:
-                    pl.append(hvq)
-                    al.append(row[self.vq_col])
-            if len(pl) >= 4:
-                pla = np.array(pl, float)
-                ala = np.array(al, float)
-                pr, pr2, pp = _pearson(pla, ala)
-                sr, sr2, sp = _spearman(pla, ala)
-                kr, kr2, kp = _kendall(pla, ala)
+                pool = cat_known[cat_known[feat].notna()]
+                if len(pool) < 4:
+                    continue
+                vq = pool[self.vq_col].values.astype(float)
+                fv = pool[feat].values.astype(float)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ratios = np.where(fv > 0, vq / fv, np.nan)
+                slope = float(np.nanmedian(ratios)) if np.any(np.isfinite(ratios)) else None
+                pr, pr2, pp = _pearson(fv, vq); sr, sr2, sp = _spearman(fv, vq); kr, kr2, kp = _kendall(fv, vq)
                 eff = _eff_r2(pr2, sr2, kr2)
-                self._reg('Historic_LastYear_Direct',
-                          'Same calendar month value from previous year',
-                          f'{len(pl)} monthly rows with historic monthly VQ',
-                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
-                          _mtype='Historic_Direct')
+                self._reg(f'{pfx}Intensity_{feat}',
+                          f'[{label}] VQ ~ {feat} intensity',
+                          f'{len(pool)} rows',
+                          slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
+                          _feat=feat, _mtype='Feature_Intensity', _ghg=ghg, _ghg_sub=ghg_sub)
+
+                pm = pool[pool['_Timeframe'] == 'Monthly']
+                if len(pm) >= 4 and cat_sea and slope:
+                    ps  = np.array([float(r[feat]) * slope * cat_sea.get(r['_Month'], 1.0)
+                                    for _, r in pm.iterrows()], float)
+                    as_ = pm[self.vq_col].values.astype(float)
+                    if len(ps) >= 4:
+                        pr, pr2, pp = _pearson(ps, as_); sr, sr2, sp = _spearman(ps, as_); kr, kr2, kp = _kendall(ps, as_)
+                        self._reg(f'{pfx}Intensity_{feat}_Seasonal',
+                                  f'[{label}] VQ ~ {feat} intensity x seasonal',
+                                  f'{len(ps)} monthly rows',
+                                  slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                                  _eff_r2(pr2, sr2, kr2),
+                                  _feat=feat, _mtype='Feature_Intensity_Seasonal',
+                                  _seasonal=True, _ghg=ghg, _ghg_sub=ghg_sub)
+
+            # 6 – Categorical
+            for feat in self.categorical_features:
+                pool = cat_known[cat_known[feat].notna()]
+                if len(pool) < 4:
+                    continue
+                vq    = pool[self.vq_col].values.astype(float)
+                codes = pd.Categorical(pool[feat]).codes.astype(float)
+                pbr, pbr2, pbp = _pointbiserial(codes, vq)
+                self._reg(f'{pfx}Categorical_{feat}',
+                          f'[{label}] Group mean VQ by {feat}',
+                          f'{len(pool)} rows',
+                          None, None, None, None, None, None, None, None, None, None,
+                          pbr, pbr2, pbp, _eff_r2(None, None, pbr2=pbr2),
+                          _feat=feat, _mtype='Categorical',
+                          _cat_means=pool.groupby(feat)[self.vq_col].mean().to_dict(),
+                          _ghg=ghg, _ghg_sub=ghg_sub)
+
+            # 7 – Historic-adjusted
+            if self.historic_vq:
+                for feat in self.numeric_features:
+                    preds_h, acts_h = [], []
+                    for _, row in mn.iterrows():
+                        site  = str(row.get(self.site_col, '')).strip()
+                        month = row['_Month']
+                        cf    = row.get(feat)
+                        if pd.isna(cf) or not month:
+                            continue
+                        ckey = self._composite_key(row)
+                        hvq  = self.historic_vq.get(ckey, {}).get(month)
+                        if hvq is None:
+                            ha = self.historic_vq.get(ckey, {}).get('ANNUAL')
+                            if ha:
+                                hvq = (ha / 12) * cat_sea.get(month, 1.0)
+                        if hvq is None:
+                            continue
+                        hf = self.historic_feats.get(site, {}).get(feat)
+                        if hf and float(hf) != 0:
+                            preds_h.append(hvq * (float(cf) / float(hf)))
+                            acts_h.append(row[self.vq_col])
+                    if len(preds_h) >= 4:
+                        ph, ah = np.array(preds_h, float), np.array(acts_h, float)
+                        pr, pr2, pp = _pearson(ph, ah); sr, sr2, sp = _spearman(ph, ah); kr, kr2, kp = _kendall(ph, ah)
+                        self._reg(f'{pfx}Historic_Adjusted_{feat}',
+                                  f'[{label}] Historic VQ x ({feat} ratio)',
+                                  f'{len(preds_h)} rows',
+                                  None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                                  _eff_r2(pr2, sr2, kr2),
+                                  _feat=feat, _mtype='Historic_Adjusted', _ghg=ghg, _ghg_sub=ghg_sub)
+
+                pl, al = [], []
+                for _, row in mn.iterrows():
+                    ckey = self._composite_key(row)
+                    hvq  = self.historic_vq.get(ckey, {}).get(row['_Month'])
+                    if hvq is not None:
+                        pl.append(hvq); al.append(row[self.vq_col])
+                if len(pl) >= 4:
+                    pla, ala = np.array(pl, float), np.array(al, float)
+                    pr, pr2, pp = _pearson(pla, ala); sr, sr2, sp = _spearman(pla, ala); kr, kr2, kp = _kendall(pla, ala)
+                    self._reg(f'{pfx}Historic_LastYear_Direct',
+                              f'[{label}] Same month previous year',
+                              f'{len(pl)} rows',
+                              None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                              _eff_r2(pr2, sr2, kr2),
+                              _mtype='Historic_Direct', _ghg=ghg, _ghg_sub=ghg_sub)
 
         print(f"  {len(self.stat_methods)} stat/rule methods registered")
 
@@ -942,37 +1044,44 @@ class ExtrapolationTool:
     # ── ML models ─────────────────────────────────────────────────────────────
 
     def train_ml_models(self):
+        """FIX 2: Models trained per GHG category; keys prefixed accordingly."""
         print("\n" + "=" * 60)
         print("MACHINE LEARNING MODELS")
         print("=" * 60)
-        mn    = self.known[self.known['_Timeframe'] == 'Monthly']
-        all_k = self.known
 
-        data_sources = []
-        data_sources.append(f'Input file ({len(self.known)} known rows)')
+        data_sources = [f'Input file ({len(self.known)} known rows)']
         if self.historic_vq:
-            data_sources.append(f'Historic records ({len(self.historic_vq)} sites)')
+            data_sources.append(f'Historic records ({len(self.historic_vq)} keys)')
         if self.historic_feats:
             data_sources.append(f'Historic features ({len(self.historic_feats)} sites)')
         self._data_sources_label = ' + '.join(data_sources)
 
-        if len(mn) >= 6:
-            self._train_subset(mn, ['_Month'] + self.numeric_features,
-                               'Monthly', self.categorical_features)
-        if len(all_k) >= 6:
-            self._train_subset(all_k, self.numeric_features,
-                               'All', self.categorical_features)
-        for cat in self.categorical_features:
-            sub = self.known[self.known[cat].notna()]
-            if len(sub) >= 6:
-                self._train_subset(sub, ['_Month'] + self.numeric_features,
-                                   f'By_{cat}', [cat] + self.categorical_features)
+        for ghg, ghg_sub in self._unique_ghg_combos(self.known):
+            pfx       = ghg + (f'__{ghg_sub}' if ghg_sub else '') + '__'
+            cat_known = self._filter_to_ghg(self.known, ghg, ghg_sub)
+            mn        = cat_known[cat_known['_Timeframe'] == 'Monthly']
+
+            if len(mn) >= 6:
+                self._train_subset(mn,
+                                   ['_Month'] + self.numeric_features,
+                                   f'{pfx}Monthly', self.categorical_features)
+            if len(cat_known) >= 6:
+                self._train_subset(cat_known,
+                                   self.numeric_features,
+                                   f'{pfx}All', self.categorical_features)
+            for cat in self.categorical_features:
+                sub = cat_known[cat_known[cat].notna()]
+                if len(sub) >= 6:
+                    self._train_subset(sub,
+                                       ['_Month'] + self.numeric_features,
+                                       f'{pfx}By_{cat}', [cat] + self.categorical_features)
+
         print(f"  {len(self.ml_models)} ML models trained")
 
     def _train_subset(self, df_sub, feat_cols, prefix, cat_cols=None):
         cat_cols = cat_cols or []
-        encoders = {}
-        valid = []
+        encoders, valid = {}, []
+
         for fc in feat_cols:
             if fc == '_Month' and '_Month' in df_sub.columns:
                 enc = LabelEncoder()
@@ -1005,8 +1114,7 @@ class ExtrapolationTool:
             if fc in encoders:
                 vals = rows_ok[fc].fillna('Unknown').astype(str)
                 try:
-                    enc = encoders[fc]
-                    X_parts.append(enc.transform(vals).reshape(-1, 1))
+                    X_parts.append(encoders[fc].transform(vals).reshape(-1, 1))
                 except Exception:
                     enc2 = LabelEncoder()
                     enc2.fit(vals)
@@ -1018,16 +1126,15 @@ class ExtrapolationTool:
 
         X = np.hstack(X_parts).astype(float)
         y = rows_ok[self.vq_col].values.astype(float)
-        feat_label = ', '.join(
-            fc.replace('_Month', 'Month').replace('_', ' ').strip() for fc in valid)
+        feat_label = ', '.join(fc.replace('_Month', 'Month').replace('_', ' ').strip() for fc in valid)
 
         for mname, mobj in [
-            ('Linear_Regression', LinearRegression()),
+            ('Linear_Regression',    LinearRegression()),
             ('Polynomial_Regression', make_pipeline(PolynomialFeatures(2), LinearRegression())),
-            ('Random_Forest',
-             RandomForestRegressor(n_estimators=100, random_state=42, max_depth=10, n_jobs=-1)),
-            ('Gradient_Boosting',
-             GradientBoostingRegressor(n_estimators=100, random_state=42, max_depth=5)),
+            ('Random_Forest',         RandomForestRegressor(n_estimators=100, random_state=42,
+                                                             max_depth=10, n_jobs=-1)),
+            ('Gradient_Boosting',     GradientBoostingRegressor(n_estimators=100, random_state=42,
+                                                                  max_depth=5)),
         ]:
             key = f'{prefix}_{mname}'
             r2, n_train, n_test, n_folds, cv_type = _cv_r2_with_meta(mobj, X, y)
@@ -1039,10 +1146,7 @@ class ExtrapolationTool:
                 model=mobj, features=valid, encoders=encoders,
                 r2=float(r2), type=mname.replace('_', ' '),
                 description=f'{mname.replace("_"," ")} using {feat_label}. CV R2={r2:.3f} (n={n_train})',
-                n_train=n_train,
-                n_test_per_fold=n_test,
-                n_folds=n_folds,
-                cv_type=cv_type,
+                n_train=n_train, n_test_per_fold=n_test, n_folds=n_folds, cv_type=cv_type,
                 data_sources=getattr(self, '_data_sources_label', ''),
                 predictions_made=0,
             )
@@ -1053,81 +1157,65 @@ class ExtrapolationTool:
 
     def predict_row(self, row):
         """
-        Two-stage waterfall:
+        Two-stage waterfall. FIX 2: every tier uses GHG-prefixed methods so
+        only same-category data informs a prediction.
 
-        STAGE 1 — site anchor (the VQ level):
-          Tier 1: Site has own actuals          → site mean VQ
-          Tier 2: Site has historic data         → historic monthly VQ (adj for feature change)
-          Tier 3: No data for this site          → categorical group mean, then ML level,
-                                                   then feature intensity, then cross-site avg
-
-        STAGE 2 — seasonal index applied to anchor:
-          Per-site index if site has ≥3 known months, else cross-dataset.
-          Always applied so no two months ever get the same flat value.
-
-        Sanity: clip to [0, 3×p99]. Reject negatives.
+        STAGE 1 — anchor:
+          Tier 1: Site has own actuals (same category)
+          Tier 2: Site has historic data (same category) ± growth projection
+          Tier 3: categorical mean → GHG-specific ML → feature intensity → seasonal avg
+        STAGE 2 — multiply by per-category seasonal index.
         """
-        site  = str(row.get(self.site_col, '')).strip()
-        month = row.get('_Month', '')
-        tf    = row.get('_Timeframe', '')
+        site    = str(row.get(self.site_col, '')).strip()
+        month   = row.get('_Month', '')
+        tf      = row.get('_Timeframe', '')
+        ghg     = str(row.get(self.ghg_col, '') or '').strip()
+        ghg_sub = str(row.get(self.ghg_sub_col, '') or '').strip() if self.ghg_sub_col else ''
+        if ghg_sub.lower() in ('', 'nan', 'none', 'n/a', '-'):
+            ghg_sub = ''
+
+        pfx    = ghg + (f'__{ghg_sub}' if ghg_sub else '') + '__'
         lo, hi = self._vq_lo, self._vq_hi
+        ckey   = self._composite_key(row)
 
-        # Composite key: (site, ghg_category [, ghg_sub_category])
-        ckey = self._composite_key(row)
+        anchor, anchor_method, anchor_r2 = None, None, 0.0
 
-        anchor        = None
-        anchor_method = None
-        anchor_r2     = 0.0
-
-        # ── Tier 1: this site+category has own actuals in current file ────────
-        site_known = self.known[
-            self.known[self.site_col].astype(str).str.strip() == site]
-        # If GHG column exists, further filter to this category
-        if self.ghg_col and len(site_known) > 0:
-            ghg_val = row.get(self.ghg_col)
-            if pd.notna(ghg_val):
-                site_known = site_known[
-                    site_known[self.ghg_col].astype(str).str.strip() == str(ghg_val).strip()]
-            if self.ghg_sub_col:
-                ghg_sub_val = row.get(self.ghg_sub_col)
-                if pd.notna(ghg_sub_val) and len(site_known) > 0:
-                    site_known = site_known[
-                        site_known[self.ghg_sub_col].astype(str).str.strip() == str(ghg_sub_val).strip()]
+        # ── Tier 1: site has own actuals for this GHG combo ───────────────────
+        site_known = self._filter_to_ghg(
+            self.known[self.known[self.site_col].astype(str).str.strip() == site],
+            ghg, ghg_sub or None)
 
         if len(site_known) > 0:
             anchor        = float(site_known[self.vq_col].mean())
-            anchor_method = 'Site_Average_Seasonal'
-            anchor_r2     = self.stat_methods.get('Site_Average_Seasonal',
-                            self.stat_methods.get('Site_Average', {})
+            anchor_method = f'{pfx}Site_Average_Seasonal'
+            anchor_r2     = self.stat_methods.get(f'{pfx}Site_Average_Seasonal',
+                            self.stat_methods.get(f'{pfx}Site_Average', {})
                             ).get('effective_r2', 0.6)
 
-        # ── Tier 2: historic data for this site+category ──────────────────────
+        # ── Tier 2: historic data for same GHG combo ──────────────────────────
         elif ckey in self.historic_vq:
-            hist = self.historic_vq[ckey]
-            hval = hist.get(month)
+            hist           = self.historic_vq[ckey]
+            hval           = hist.get(month)
             specific_month = hval is not None
             if hval is None and 'ANNUAL' in hist:
                 hval = hist['ANNUAL'] / 12.0
 
             if hval is not None:
-                # Apply multi-year growth rate projection if available
-                # e.g. historic is 2023 data, current year is 2025 → apply rate^2
                 growth = self.historic_growth_rates.get(ckey)
                 if growth and self.historic_year and self.current_year:
-                    years_forward = self.current_year - self.historic_year
-                    if years_forward > 0:
-                        hval = hval * (growth ** years_forward)
-                        anchor_method = 'Historic_GrowthProjected'
+                    yf = self.current_year - self.historic_year
+                    if yf > 0:
+                        hval = hval * (growth ** yf)
+                        anchor_method = f'{pfx}Historic_GrowthProjected'
                     else:
-                        anchor_method = 'Historic_Direct'
+                        anchor_method = f'{pfx}Historic_Direct'
                 else:
-                    anchor_method = 'Historic_Direct'
+                    anchor_method = f'{pfx}Historic_Direct'
 
-                anchor   = float(hval)
-                anchor_r2 = self.stat_methods.get('Historic_LastYear_Direct',
+                anchor    = float(hval)
+                anchor_r2 = self.stat_methods.get(f'{pfx}Historic_LastYear_Direct',
                             {}).get('effective_r2', 0.35)
 
-                # Try feature-based adjustment on top of the anchor
                 best_adj_r2 = 0.0
                 for feat in self.numeric_features:
                     cf = row.get(feat)
@@ -1138,92 +1226,83 @@ class ExtrapolationTool:
                     if not (0.1 <= ratio <= 10.0):
                         continue
                     adj_r2 = self.stat_methods.get(
-                        f'Historic_Adjusted_{feat}', {}).get('effective_r2', 0.0)
+                        f'{pfx}Historic_Adjusted_{feat}', {}).get('effective_r2', 0.0)
                     if adj_r2 > best_adj_r2:
                         anchor        = float(hval) * ratio
-                        anchor_method = f'Historic_Adjusted_{feat}'
+                        anchor_method = f'{pfx}Historic_Adjusted_{feat}'
                         anchor_r2     = adj_r2
                         best_adj_r2   = adj_r2
 
-                # Specific monthly historic → apply seasonal once and return
-                if specific_month and anchor_method in ('Historic_Direct', 'Historic_GrowthProjected'):
-                    sf   = self._seasonal_factor(site, month)
+                if specific_month and anchor_method in (
+                        f'{pfx}Historic_Direct', f'{pfx}Historic_GrowthProjected'):
+                    sf   = self._seasonal_factor(site, month, ghg, ghg_sub or None)
                     pred = self._clip(anchor * sf, lo, hi)
                     return (pred if pred is not None
                             else float(self.known[self.vq_col].mean()),
                             anchor_method, anchor_r2)
 
-        # ── Tier 3: no actuals, no (trusted) historic — derive from features ──
-        # Runs when: site has no current actuals AND (no historic, OR historic is poor quality)
+        # ── Tier 3: derive from features (GHG-scoped only) ────────────────────
         if anchor is None:
-            # 3a: categorical group mean
+            # 3a: categorical
             for feat in self.categorical_features:
                 cv   = row.get(feat)
-                info = self.stat_methods.get(f'Categorical_{feat}', {})
+                info = self.stat_methods.get(f'{pfx}Categorical_{feat}', {})
                 cm   = info.get('_cat_means', {})
                 if pd.isna(cv) or cv not in cm:
                     continue
                 r2 = info.get('effective_r2', 0.0)
                 if r2 > anchor_r2:
-                    anchor        = float(cm[cv])
-                    anchor_method = f'Categorical_{feat}'
-                    anchor_r2     = r2
+                    anchor, anchor_method, anchor_r2 = float(cm[cv]), f'{pfx}Categorical_{feat}', r2
 
-            # 3b: ML models (neutral month → level only)
+            # 3b: GHG-specific ML models only (FIX 2: prefix filter)
             for name, info in self.ml_models.items():
+                if not name.startswith(pfx):
+                    continue
                 if tf == 'Annual' and '_Month' in info['features']:
                     continue
                 pred = self._apply_ml_level(info, row)
                 if pred is None:
                     continue
-                r2 = info['r2']
-                # nan R² (too few rows for CV) — treat as 0 for comparison,
-                # still better than no prediction at all
-                if r2 is None or (isinstance(r2, float) and np.isnan(r2)):
+                r2 = info['r2'] or 0.0
+                if isinstance(r2, float) and np.isnan(r2):
                     r2 = 0.0
                 if r2 > anchor_r2:
-                    anchor        = pred
-                    anchor_method = name
-                    anchor_r2     = r2
+                    anchor, anchor_method, anchor_r2 = pred, name, r2
 
-            # 3c: feature intensity slope
+            # 3c: feature intensity (GHG-scoped)
             for feat in self.numeric_features:
-                info  = self.stat_methods.get(f'Intensity_{feat}', {})
+                info  = self.stat_methods.get(f'{pfx}Intensity_{feat}', {})
                 slope = info.get('slope')
                 fval  = row.get(feat)
                 if slope is None or pd.isna(fval):
                     continue
                 r2 = info.get('effective_r2', 0.0)
                 if r2 > anchor_r2:
-                    anchor        = float(fval) * slope
-                    anchor_method = f'Intensity_{feat}'
-                    anchor_r2     = r2
+                    anchor, anchor_method, anchor_r2 = float(fval) * slope, f'{pfx}Intensity_{feat}', r2
 
-            # 3d: cross-site seasonal average (already shaped — return directly)
+            # 3d: GHG seasonal average
             if anchor is None:
-                ma = self.stat_methods.get('Seasonal_Average', {}).get('_month_avgs', {})
+                ma = self.stat_methods.get(f'{pfx}Seasonal_Average', {}).get('_month_avgs', {})
                 v  = ma.get(month) if month else None
                 if v is not None:
                     pred = self._clip(float(v), lo, hi)
-                    r2   = self.stat_methods.get('Seasonal_Average', {}).get('effective_r2', 0.0)
+                    r2   = self.stat_methods.get(f'{pfx}Seasonal_Average', {}).get('effective_r2', 0.0)
                     return (pred if pred is not None
                             else float(self.known[self.vq_col].mean()),
-                            'Seasonal_Average', r2)
+                            f'{pfx}Seasonal_Average', r2)
 
             if anchor is None:
-                return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+                return float(self.known[self.vq_col].mean()), f'{pfx}Overall_Average_fallback', 0.0
 
-        # ── Stage 2: apply seasonal index to anchor ───────────────────────────
-        sf         = self._seasonal_factor(site, month) if month else 1.0
+        # ── Stage 2: seasonal index ───────────────────────────────────────────
+        sf         = self._seasonal_factor(site, month, ghg, ghg_sub or None) if month else 1.0
         prediction = self._clip(anchor * sf, lo, hi)
-
         if prediction is None:
-            return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+            return float(self.known[self.vq_col].mean()), f'{pfx}Overall_Average_fallback', 0.0
 
         return prediction, anchor_method, anchor_r2
 
     def _apply_ml_level(self, info, row):
-        """Apply ML model with a neutral month encoding to get site-level VQ (no seasonal bias)."""
         X_parts = []
         for fc in info['features']:
             if fc == '_Month':
@@ -1250,42 +1329,14 @@ class ExtrapolationTool:
         except Exception:
             return None
 
-    def _apply_ml(self, info, row):
-        """Legacy direct ML apply — not used in main waterfall."""
-        X_parts = []
-        for fc in info['features']:
-            if fc in info['encoders']:
-                val = str(row.get(fc, 'Unknown'))
-                enc = info['encoders'][fc]
-                try:
-                    X_parts.append([[enc.transform([val])[0]]])
-                except Exception:
-                    X_parts.append([[0]])
-            else:
-                val = row.get(fc)
-                if pd.isna(val):
-                    return None
-                X_parts.append([[float(val)]])
-        if not X_parts:
-            return None
-        X = np.hstack([np.array(p) for p in X_parts]).astype(float)
-        try:
-            return float(info['model'].predict(X)[0])
-        except Exception:
-            return None
-
     # ── Fill blanks ───────────────────────────────────────────────────────────
 
     def fill_blanks(self):
         print("\n" + "=" * 60)
         print("FILLING MISSING VALUES")
         print("=" * 60)
-
-        # Compute sanity bounds once before predicting
         self._vq_lo, self._vq_hi = self._sanity_bounds()
         print(f"  Sanity bounds: [{self._vq_lo:.2f}, {self._vq_hi:.2f}]")
-
-        # Build categorical breakdown table for output
         self._build_cat_breakdown()
 
         results = []
@@ -1296,16 +1347,13 @@ class ExtrapolationTool:
                 self.stat_methods[method]['predictions_made'] += 1
             elif method in self.ml_models:
                 self.ml_models[method]['predictions_made'] += 1
+
         print(f"  Filled {len(results)} rows")
         if results:
             print(f"  Avg R2: {np.mean([r['r2'] for r in results]):.4f}")
         return results
 
     def _build_cat_breakdown(self):
-        """
-        For each categorical feature, compute per-category VQ stats
-        (mean, count, and seasonal means per month) for output sheet.
-        """
         mn = self.known[self.known['_Timeframe'] == 'Monthly']
         for feat in self.categorical_features:
             pool = self.known[self.known[feat].notna()]
@@ -1316,8 +1364,7 @@ class ExtrapolationTool:
                 vq_vals = grp[self.vq_col].dropna()
                 if len(vq_vals) == 0:
                     continue
-                cat_mean = float(vq_vals.mean())
-                # Per-month means for this category
+                cat_mean    = float(vq_vals.mean())
                 monthly_grp = mn[mn[feat] == cat_val]
                 month_means = {}
                 if len(monthly_grp) >= 2:
@@ -1339,17 +1386,12 @@ class ExtrapolationTool:
     def build_output(self, results):
         out = self.df.copy()
 
-        # Ensure these three columns exist — they may already be present in the input
         if 'Data integrity' not in out.columns:
             out['Data integrity'] = 'Actual'
         else:
             out['Data integrity'] = out['Data integrity'].fillna('Actual')
-
-        if 'Estimation Method' not in out.columns:
-            out['Estimation Method'] = ''
-
-        if 'Data Quality Score' not in out.columns:
-            out['Data Quality Score'] = np.nan
+        if 'Estimation Method'  not in out.columns: out['Estimation Method']  = ''
+        if 'Data Quality Score' not in out.columns: out['Data Quality Score'] = np.nan
 
         for r in results:
             i = r['index']
@@ -1360,9 +1402,7 @@ class ExtrapolationTool:
 
         out.drop(columns=['_Timeframe', '_Month'], errors='ignore', inplace=True)
 
-        # Reorder columns: put the three extrapolation result columns immediately
-        # after Volumetric Quantity, then everything else in original order
-        cols = list(out.columns)
+        cols        = list(out.columns)
         result_cols = ['Data integrity', 'Estimation Method', 'Data Quality Score']
         base_cols   = [c for c in cols if c not in result_cols]
         vq_idx      = base_cols.index(self.vq_col) if self.vq_col in base_cols else len(base_cols)
@@ -1388,15 +1428,13 @@ class ExtrapolationTool:
                 'Data integrity': 'Actual' if pd.notna(row.get(self.vq_col)) else 'Missing',
             }
             for f in self.numeric_features:
-                v = row.get(f)
-                entry[f] = v if pd.notna(v) else ''
+                v = row.get(f); entry[f] = v if pd.notna(v) else ''
             for f in self.categorical_features:
-                v = row.get(f)
-                entry[f] = v if pd.notna(v) else ''
+                v = row.get(f); entry[f] = v if pd.notna(v) else ''
             if self.historic_vq:
                 ckey = self._composite_key(row)
-                hvq = (self.historic_vq.get(ckey, {}).get(month)
-                       or self.historic_vq.get(ckey, {}).get('ANNUAL', ''))
+                hvq  = (self.historic_vq.get(ckey, {}).get(month)
+                        or self.historic_vq.get(ckey, {}).get('ANNUAL', ''))
                 entry['Historic Volumetric Quantity'] = hvq
                 for f in self.numeric_features:
                     entry[f'Historic {f}'] = self.historic_feats.get(site, {}).get(f, '')
@@ -1408,123 +1446,101 @@ class ExtrapolationTool:
         rows = []
         for name, info in self.stat_methods.items():
             rows.append({
-                'Method': name,
-                'Description': info['description'],
-                'Input Data': info['input_data'],
-                'Intensity_Slope': info.get('slope'),
-                'Pearson_r': info.get('pearson_r'),
-                'Pearson_R2': info.get('pearson_r2'),
-                'Pearson_p': info.get('pearson_p'),
-                'Spearman_r': info.get('spearman_r'),
-                'Spearman_R2': info.get('spearman_r2'),
-                'Spearman_p': info.get('spearman_p'),
-                'Kendall_tau': info.get('kendall_tau'),
-                'Kendall_R2': info.get('kendall_r2'),
-                'Kendall_p': info.get('kendall_p'),
-                'PointBiserial_r': info.get('pointbiserial_r'),
-                'PointBiserial_R2': info.get('pointbiserial_r2'),
-                'PointBiserial_p': info.get('pointbiserial_p'),
-                'Effective_R2': round(info['effective_r2'], 4),
+                'Method':             name,
+                'Description':        info['description'],
+                'Input Data':         info['input_data'],
+                'GHG_Category':       info.get('_ghg', ''),
+                'GHG_Sub_Category':   info.get('_ghg_sub', ''),
+                'Intensity_Slope':    info.get('slope'),
+                'Pearson_r':          info.get('pearson_r'),
+                'Pearson_R2':         info.get('pearson_r2'),
+                'Pearson_p':          info.get('pearson_p'),
+                'Spearman_r':         info.get('spearman_r'),
+                'Spearman_R2':        info.get('spearman_r2'),
+                'Spearman_p':         info.get('spearman_p'),
+                'Kendall_tau':        info.get('kendall_tau'),
+                'Kendall_R2':         info.get('kendall_r2'),
+                'Kendall_p':          info.get('kendall_p'),
+                'PointBiserial_r':    info.get('pointbiserial_r'),
+                'PointBiserial_R2':   info.get('pointbiserial_r2'),
+                'PointBiserial_p':    info.get('pointbiserial_p'),
+                'Effective_R2':       round(info['effective_r2'], 4),
                 'Used_In_Prediction': 'Yes' if info['predictions_made'] > 0 else 'No',
-                'Predictions_Made': info['predictions_made'],
+                'Predictions_Made':   info['predictions_made'],
             })
         df = pd.DataFrame(rows)
         if len(df):
-            df = df.sort_values('Effective_R2', ascending=False).reset_index(drop=True)
+            df = df.sort_values(['GHG_Category', 'Effective_R2'],
+                                ascending=[True, False]).reset_index(drop=True)
         return df
 
     def _sheet_ml(self):
         rows = []
         for name, info in self.ml_models.items():
-            feats = ', '.join(
-                fc.replace('_Month', 'Month').replace('_', ' ').strip()
-                for fc in info['features'])
-            n_train      = info.get('n_train', '')
-            n_test       = info.get('n_test_per_fold', '')
-            n_folds      = info.get('n_folds', '')
-            cv_type      = info.get('cv_type', '')
-            data_sources = info.get('data_sources', '')
-            n_features   = len(info['features'])
-            r2_raw       = info['r2']
-
-            # nan R² happens with LeaveOneOut on very small datasets —
-            # R² is undefined when there's only 1 test point per fold
+            feats  = ', '.join(fc.replace('_Month', 'Month').replace('_', ' ').strip()
+                               for fc in info['features'])
+            r2_raw = info['r2']
             if r2_raw is None or (isinstance(r2_raw, float) and np.isnan(r2_raw)):
-                cv_r2_display = None
-                reliability   = 'R² undefined — only 1 test point per fold (n too small for CV)'
+                cv_r2, reliability = None, 'R² undefined — n too small for CV'
             elif r2_raw < 0:
-                cv_r2_display = round(r2_raw, 4)
-                reliability   = 'Negative R² — model worse than predicting the mean (overfitting)'
+                cv_r2, reliability = round(r2_raw, 4), 'Negative R² — worse than mean (overfitting)'
             elif r2_raw < 0.1:
-                cv_r2_display = round(r2_raw, 4)
-                reliability   = 'Very weak — little predictive signal in these features'
+                cv_r2, reliability = round(r2_raw, 4), 'Very weak'
             elif r2_raw < 0.3:
-                cv_r2_display = round(r2_raw, 4)
-                reliability   = 'Weak — used only when no better method available'
+                cv_r2, reliability = round(r2_raw, 4), 'Weak'
             elif r2_raw < 0.6:
-                cv_r2_display = round(r2_raw, 4)
-                reliability   = 'Moderate'
+                cv_r2, reliability = round(r2_raw, 4), 'Moderate'
             else:
-                cv_r2_display = round(r2_raw, 4)
-                reliability   = 'Good'
-
+                cv_r2, reliability = round(r2_raw, 4), 'Good'
             rows.append({
-                'Model': name,
-                'Type': info['type'],
-                'CV_R2': cv_r2_display,
-                'Reliability': reliability,
-                'Features_Used': feats,
-                'N_Features': n_features,
-                'N_Train_Rows': n_train,
-                'N_Test_Rows_Per_Fold': n_test,
-                'N_Folds': n_folds,
-                'CV_Method': cv_type,
-                'Data_Sources': data_sources,
+                'Model': name, 'Type': info['type'], 'CV_R2': cv_r2,
+                'Reliability': reliability, 'Features_Used': feats,
+                'N_Features': len(info['features']),
+                'N_Train_Rows': info.get('n_train', ''),
+                'N_Test_Rows_Per_Fold': info.get('n_test_per_fold', ''),
+                'N_Folds': info.get('n_folds', ''),
+                'CV_Method': info.get('cv_type', ''),
+                'Data_Sources': info.get('data_sources', ''),
                 'Description': info['description'],
                 'Predictions_Made': info['predictions_made'],
             })
         if not rows:
             return pd.DataFrame()
-        # Sort: non-null R² descending first, then null ones at bottom
         df = pd.DataFrame(rows)
-        df['_sort'] = df['CV_R2'].fillna(-999)
-        df = df.sort_values('_sort', ascending=False).drop(columns='_sort').reset_index(drop=True)
-        return df
+        df['_s'] = df['CV_R2'].fillna(-999)
+        return df.sort_values('_s', ascending=False).drop(columns='_s').reset_index(drop=True)
 
     def _sheet_yoy(self, out):
-        hy = self.historic_year or 'Prev'
-        cy = self.current_year  or 'Current'
+        hy        = self.historic_year or 'Prev'
+        cy        = self.current_year  or 'Current'
         month_map = self.df['_Month'].to_dict() if '_Month' in self.df.columns else {}
-        rows = []
+        rows      = []
 
-        # Iterate over unique composite keys that appear in both output and historic
-        all_ckeys = set(self.historic_vq.keys())
-        # Build a lookup from composite key → output rows
         out_ckey_map = {}
         for idx, row in out.iterrows():
-            ckey = self._composite_key(row)
-            out_ckey_map.setdefault(ckey, []).append(idx)
+            out_ckey_map.setdefault(self._composite_key(row), []).append(idx)
 
-        matched_ckeys = [ck for ck in sorted(all_ckeys, key=lambda x: str(x))
-                         if ck in out_ckey_map]
+        matched = [ck for ck in sorted(self.historic_vq.keys(), key=str)
+                   if ck in out_ckey_map]
 
-        for ckey in matched_ckeys:
+        for ckey in matched:
             site    = ckey[0]
             ghg     = ckey[1] if len(ckey) > 1 else ''
             ghg_sub = ckey[2] if len(ckey) > 2 else ''
             label   = site + (f' / {ghg}' if ghg else '') + (f' / {ghg_sub}' if ghg_sub else '')
+            cat_key = (ghg, ghg_sub) if ghg_sub else (ghg,) if ghg else ()
+            cat_sea = self.seasonal_patterns.get(cat_key, {})
 
-            ckey_out_rows = out.loc[out_ckey_map[ckey]]
-            hist = self.historic_vq[ckey]
+            ckey_rows = out.loc[out_ckey_map[ckey]]
+            hist      = self.historic_vq[ckey]
             h_tot, c_tot = 0.0, 0.0
 
             for month in MONTHS_ORDER:
-                m_idx = [i for i in ckey_out_rows.index if month_map.get(i, '') == month]
-                curr_vq = float(ckey_out_rows.loc[m_idx[0], self.vq_col]) if m_idx else None
+                m_idx   = [i for i in ckey_rows.index if month_map.get(i, '') == month]
+                curr_vq = float(ckey_rows.loc[m_idx[0], self.vq_col]) if m_idx else None
                 hist_vq = hist.get(month)
                 if hist_vq is None and 'ANNUAL' in hist:
-                    sf = self.seasonal_patterns.get(month, 1.0)
-                    hist_vq = (hist['ANNUAL'] / 12) * sf
+                    hist_vq = (hist['ANNUAL'] / 12) * cat_sea.get(month, 1.0)
 
                 chg = (curr_vq - hist_vq) if curr_vq is not None and hist_vq else None
                 pct = round(chg / hist_vq * 100, 1) if (chg and hist_vq) else None
@@ -1533,10 +1549,10 @@ class ExtrapolationTool:
                 if m_idx and m_idx[0] in out.index:
                     r = out.loc[m_idx[0]]
                     is_est = r.get('Data integrity', '') == 'Estimated'
-                    em  = r.get('Estimation Method', '') if is_est else ''
-                    dqs = r.get('Data Quality Score')    if is_est else None
+                    em     = r.get('Estimation Method', '') if is_est else ''
+                    dqs    = r.get('Data Quality Score')    if is_est else None
 
-                row_dict = {
+                rows.append({
                     'Site': label, 'Month': month,
                     f'VQ_{hy}': round(hist_vq, 2) if hist_vq else None,
                     f'VQ_{cy}': round(curr_vq, 2) if curr_vq else None,
@@ -1548,8 +1564,7 @@ class ExtrapolationTool:
                     'Flag': ('Large change' if pct and abs(pct) > 50
                              else 'Normal' if pct and abs(pct) < 10
                              else 'Moderate') if pct else '',
-                }
-                rows.append(row_dict)
+                })
                 if hist_vq: h_tot += hist_vq
                 if curr_vq: c_tot += curr_vq
 
@@ -1562,31 +1577,20 @@ class ExtrapolationTool:
                 'VQ_Change_%': round(chg_tot / h_tot * 100, 1) if (chg_tot and h_tot) else None,
                 'Estimated': '', 'Flag': '', 'Estimation Method': '', 'Data Quality Score': None,
             })
+
         return pd.DataFrame(rows) if rows else None
 
     def _sheet_cat_breakdown(self):
-        """
-        Categorical Feature Breakdown sheet.
-        One row per category value per feature, showing:
-        - How many rows and sites it's based on
-        - Mean, min, max VQ
-        - Per-month mean VQ (Jan–Dec columns)
-        This tells you e.g. that 'Brand A' predictions are based on 47 rows across 8 sites.
-        """
         rows = []
         for feat, cats in self.cat_breakdown.items():
-            for cat_val, stats in cats.items():
+            for cat_val, s in cats.items():
                 row = {
-                    'Feature': feat,
-                    'Category': cat_val,
-                    'N_Rows': stats['n_rows'],
-                    'N_Sites': stats['n_sites'],
-                    'Mean_VQ': stats['mean_vq'],
-                    'Min_VQ':  stats['min_vq'],
-                    'Max_VQ':  stats['max_vq'],
+                    'Feature': feat, 'Category': cat_val,
+                    'N_Rows': s['n_rows'], 'N_Sites': s['n_sites'],
+                    'Mean_VQ': s['mean_vq'], 'Min_VQ': s['min_vq'], 'Max_VQ': s['max_vq'],
                 }
                 for mo in MONTHS_ORDER:
-                    row[mo] = stats['month_means'].get(mo, '')
+                    row[mo] = s['month_means'].get(mo, '')
                 rows.append(row)
         if not rows:
             return pd.DataFrame({'Message': ['No categorical features selected']})
