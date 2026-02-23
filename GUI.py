@@ -4,6 +4,10 @@ GUI for Volumetric Extrapolation Tool
 Matches original interface. New: Features button opens a selector popup
 that scans the input file, scores columns, and lets the user choose which
 to include as numeric/categorical features.
+
+Category picker popup: if multiple GHG categories have blank rows, a dialog
+appears before processing so the user can select the target category.
+All other categories are used as features automatically.
 """
 
 import tkinter as tk
@@ -16,7 +20,7 @@ import json
 from pathlib import Path
 import numpy as np
 
-from Data_Extrapolation import ExtrapolationTool, scan_features
+from Data_Extrapolation import ExtrapolationTool, scan_features, scan_categories_with_blanks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,16 +41,114 @@ class TextRedirector:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature selector popup
+# Category picker popup
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CategoryPickerDialog(tk.Toplevel):
+    """
+    Modal popup shown when multiple GHG categories have blank VQ rows.
+    User selects exactly one category to extrapolate; all others become features.
+    """
+
+    BG      = "#F4F6F7"
+    PRIMARY = "#2C3E50"
+    ACCENT  = "#3498DB"
+    SUCCESS = "#27AE60"
+    TEXT    = "#2C3E50"
+    LITE    = "#7F8C8D"
+
+    def __init__(self, parent, categories):
+        """
+        categories: list of dicts from scan_categories_with_blanks()
+          [{label, ghg, ghg_sub, n_blank, n_total}, ...]
+        """
+        super().__init__(parent)
+        self.title("Select Target Category")
+        self.geometry("560x420")
+        self.resizable(False, False)
+        self.configure(bg=self.BG)
+        self.transient(parent)
+        self.grab_set()
+
+        self.categories = categories
+        self.result_ghg     = None
+        self.result_ghg_sub = None
+        self.cancelled = True
+
+        self._build(categories)
+
+    def _build(self, categories):
+        # Header
+        hdr = tk.Frame(self, bg=self.PRIMARY, pady=16, padx=20)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text="Select Target Category",
+                 font=('Segoe UI', 15, 'bold'),
+                 fg='white', bg=self.PRIMARY).pack(anchor='w')
+        tk.Label(hdr,
+                 text="Multiple categories have missing values. Choose which one to extrapolate. "
+                      "All other categories will be used as predictive features automatically.",
+                 font=('Segoe UI', 9), fg='#BDC3C7', bg=self.PRIMARY,
+                 wraplength=500, justify='left').pack(anchor='w', pady=(4, 0))
+
+        # Radio button list
+        body = tk.Frame(self, bg=self.BG, padx=20, pady=16)
+        body.pack(fill='both', expand=True)
+
+        self._sel_var = tk.IntVar(value=0)
+
+        for i, cat in enumerate(categories):
+            row = tk.Frame(body, bg=self.BG, pady=6, padx=10,
+                           highlightbackground='#D5D8DC', highlightthickness=1)
+            row.pack(fill='x', pady=3)
+
+            rb = tk.Radiobutton(row, variable=self._sel_var, value=i,
+                                bg=self.BG, activebackground=self.BG, cursor='hand2')
+            rb.pack(side='left')
+
+            info = tk.Frame(row, bg=self.BG)
+            info.pack(side='left', fill='x', expand=True, padx=(6, 0))
+            tk.Label(info, text=cat['label'],
+                     font=('Segoe UI', 10, 'bold'),
+                     fg=self.PRIMARY, bg=self.BG).pack(anchor='w')
+            tk.Label(info,
+                     text=f"{cat['n_blank']} blank rows of {cat['n_total']} total",
+                     font=('Segoe UI', 8), fg=self.LITE, bg=self.BG).pack(anchor='w')
+
+            # Feature badge for non-first items
+            badge_text = "Will become a feature" if i > 0 else "← select to extrapolate this"
+            tk.Label(row, text=badge_text,
+                     font=('Segoe UI', 8, 'italic'), fg=self.LITE, bg=self.BG).pack(
+                side='right', padx=8)
+
+        # Buttons
+        btn_bar = tk.Frame(self, bg=self.BG, pady=12, padx=20)
+        btn_bar.pack(fill='x', side='bottom')
+
+        tk.Button(btn_bar, text='Cancel',
+                  font=('Segoe UI', 10), fg='white',
+                  bg='#BDC3C7', activebackground='#95A5A6',
+                  relief='flat', padx=18, pady=8, cursor='hand2',
+                  command=self.destroy).pack(side='right', padx=(8, 0))
+        tk.Button(btn_bar, text='Confirm',
+                  font=('Segoe UI', 10, 'bold'), fg='white',
+                  bg=self.ACCENT, activebackground='#2980B9',
+                  relief='flat', padx=18, pady=8, cursor='hand2',
+                  command=self._confirm).pack(side='right')
+
+    def _confirm(self):
+        idx = self._sel_var.get()
+        cat = self.categories[idx]
+        self.result_ghg     = cat['ghg']
+        self.result_ghg_sub = cat['ghg_sub']
+        self.cancelled = False
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature selector popup  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FeatureSelectorDialog(tk.Toplevel):
-    """
-    Modal popup showing detected feature columns from the input file.
-    Recommended features are pre-ticked. User can toggle any on/off.
-    Returns selected numeric and categorical features on confirm.
-    """
-
     BG      = "#F4F6F7"
     CARD    = "#FFFFFF"
     PRIMARY = "#2C3E50"
@@ -75,7 +177,6 @@ class FeatureSelectorDialog(tk.Toplevel):
         self._scan_and_build()
 
     def _scan_and_build(self):
-        # Loading label while scanning
         loading = ttk.Label(self, text="Scanning file for feature columns...",
                             font=('Segoe UI', 11), background=self.BG,
                             foreground=self.LITE)
@@ -94,7 +195,6 @@ class FeatureSelectorDialog(tk.Toplevel):
         self._build_ui()
 
     def _build_ui(self):
-        # ── Header ────────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=self.PRIMARY, pady=16, padx=20)
         hdr.pack(fill='x')
         tk.Label(hdr, text="Feature Selection",
@@ -106,17 +206,14 @@ class FeatureSelectorDialog(tk.Toplevel):
                  font=('Segoe UI', 9), fg='#BDC3C7', bg=self.PRIMARY,
                  wraplength=720, justify='left').pack(anchor='w', pady=(4, 0))
 
-        # ── Legend ────────────────────────────────────────────────────────────
         leg = tk.Frame(self, bg=self.BG, pady=8, padx=20)
         leg.pack(fill='x')
         for colour, label in [(self.SUCCESS, '● Recommended'), (self.WARNING, '● Optional')]:
             tk.Label(leg, text=label, font=('Segoe UI', 9, 'bold'),
                      fg=colour, bg=self.BG).pack(side='left', padx=(0, 20))
-        tk.Label(leg,
-                 text="Recommendations based on fill rate (≥50%) and data variance",
+        tk.Label(leg, text="Recommendations based on fill rate (≥50%) and data variance",
                  font=('Segoe UI', 8), fg=self.LITE, bg=self.BG).pack(side='left')
 
-        # ── Scrollable feature list ───────────────────────────────────────────
         list_outer = tk.Frame(self, bg=self.BG, padx=15, pady=5)
         list_outer.pack(fill='both', expand=True)
 
@@ -129,8 +226,6 @@ class FeatureSelectorDialog(tk.Toplevel):
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(cw, width=e.width))
         canvas.configure(yscrollcommand=vsb.set)
 
-        # Bind mousewheel to canvas only (not bind_all) so it doesn't
-        # outlive this dialog and try to scroll a destroyed widget
         def _on_scroll(e):
             try:
                 canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
@@ -138,19 +233,16 @@ class FeatureSelectorDialog(tk.Toplevel):
                 pass
 
         canvas.bind('<MouseWheel>', _on_scroll)
-        # Also bind to inner frame and children so scroll works anywhere in dialog
         self.bind('<MouseWheel>', _on_scroll)
-
         vsb.pack(side='right', fill='y')
         canvas.pack(side='left', fill='both', expand=True)
 
-        self.check_vars = {}  # {col_name: BooleanVar}
+        self.check_vars = {}
 
         if not self.features:
             tk.Label(inner, text="No suitable feature columns found in this file.",
                      font=('Segoe UI', 10), fg=self.LITE, bg=self.BG).pack(pady=20)
         else:
-            # Section headers
             sections = [
                 ('Numeric Features',     [f for f in self.features if f['type'] == 'Numeric']),
                 ('Categorical Features', [f for f in self.features if f['type'] == 'Categorical']),
@@ -158,22 +250,18 @@ class FeatureSelectorDialog(tk.Toplevel):
             for section_title, feats in sections:
                 if not feats:
                     continue
-                # Section label
                 sec_lbl = tk.Frame(inner, bg=self.BG)
                 sec_lbl.pack(fill='x', pady=(12, 4), padx=4)
                 tk.Label(sec_lbl, text=section_title,
                          font=('Segoe UI', 10, 'bold'),
                          fg=self.PRIMARY, bg=self.BG).pack(anchor='w')
                 tk.Frame(sec_lbl, bg='#D5D8DC', height=1).pack(fill='x', pady=(2, 0))
-
                 for feat in feats:
                     self._add_feature_row(inner, feat)
 
-        # ── Buttons ───────────────────────────────────────────────────────────
         btn_bar = tk.Frame(self, bg=self.BG, pady=12, padx=20)
         btn_bar.pack(fill='x', side='bottom')
 
-        # Select all / none shortcuts
         tk.Button(btn_bar, text='Select All',
                   font=('Segoe UI', 9), fg=self.ACCENT, bg=self.BG,
                   relief='flat', cursor='hand2',
@@ -201,35 +289,25 @@ class FeatureSelectorDialog(tk.Toplevel):
     def _add_feature_row(self, parent, feat):
         recommended = feat['recommended']
         row_bg = self.REC_BG if recommended else self.OPT_BG
-
         row = tk.Frame(parent, bg=row_bg, pady=8, padx=12,
                        highlightbackground='#D5D8DC', highlightthickness=1)
         row.pack(fill='x', pady=2, padx=4)
-
-        # Checkbox
         var = tk.BooleanVar(value=recommended)
         self.check_vars[feat['name']] = var
         cb = tk.Checkbutton(row, variable=var, bg=row_bg,
                             activebackground=row_bg, cursor='hand2')
         cb.pack(side='left', padx=(0, 8))
-
-        # Status dot + name
         dot_colour = self.SUCCESS if recommended else self.WARNING
         status     = 'Recommended' if recommended else 'Optional'
         tk.Label(row, text='●', fg=dot_colour, bg=row_bg,
                  font=('Segoe UI', 10)).pack(side='left')
-
         name_f = tk.Frame(row, bg=row_bg)
         name_f.pack(side='left', fill='x', expand=True, padx=(6, 0))
-
         tk.Label(name_f, text=feat['name'],
                  font=('Segoe UI', 10, 'bold'),
                  fg=self.PRIMARY, bg=row_bg).pack(anchor='w')
-        tk.Label(name_f,
-                 text=f"{feat['type']}  ·  {status}  ·  {feat['reason']}",
+        tk.Label(name_f, text=f"{feat['type']}  ·  {status}  ·  {feat['reason']}",
                  font=('Segoe UI', 8), fg=self.LITE, bg=row_bg).pack(anchor='w')
-
-        # Stats badges
         stats_f = tk.Frame(row, bg=row_bg)
         stats_f.pack(side='right', padx=(10, 0))
         for label, value in [
@@ -240,8 +318,7 @@ class FeatureSelectorDialog(tk.Toplevel):
             badge = tk.Frame(stats_f, bg='#D5D8DC', padx=6, pady=2)
             badge.pack(side='left', padx=2)
             tk.Label(badge, text=f"{label}: {value}",
-                     font=('Segoe UI', 8), fg=self.TEXT,
-                     bg='#D5D8DC').pack()
+                     font=('Segoe UI', 8), fg=self.TEXT, bg='#D5D8DC').pack()
 
     def _toggle_all(self, state):
         for var in self.check_vars.values():
@@ -254,15 +331,12 @@ class FeatureSelectorDialog(tk.Toplevel):
     def _confirm(self):
         selected = {name for name, var in self.check_vars.items() if var.get()}
         feat_map = {f['name']: f for f in self.features}
-
         self.result_numeric = [
             name for name in selected
-            if name in feat_map and feat_map[name]['type'] == 'Numeric'
-        ]
+            if name in feat_map and feat_map[name]['type'] == 'Numeric']
         self.result_categorical = [
             name for name in selected
-            if name in feat_map and feat_map[name]['type'] == 'Categorical'
-        ]
+            if name in feat_map and feat_map[name]['type'] == 'Categorical']
         self.cancelled = False
         self.destroy()
 
@@ -293,34 +367,32 @@ class ExtrapolationGUI:
         self.input_file_path        = tk.StringVar()
         self.historic_records_path  = tk.StringVar()
         self.historic_features_path = tk.StringVar()
-        # Factor database persists across sessions — saved to config file
         self.factor_database_path   = tk.StringVar()
         self.is_processing = False
 
-        # Feature selection state — None means "auto-detect"
         self.selected_numeric_features     = None
         self.selected_categorical_features = None
+
+        # Target category — set by CategoryPickerDialog if needed
+        self.target_ghg     = None
+        self.target_ghg_sub = None
 
         self.config_file = Path.home() / '.extrapolation_tool_config.json'
 
         self._build_styles()
         self._build_ui()
-        self._load_config()   # restore persisted paths after UI is built
+        self._load_config()
 
         sys.stdout = TextRedirector(self.log_text)
 
     def _save_config(self):
-        """Save persistent state to JSON so it survives app restarts."""
         try:
-            data = {
-                'factor_database_path': self.factor_database_path.get(),
-            }
+            data = {'factor_database_path': self.factor_database_path.get()}
             self.config_file.write_text(json.dumps(data, indent=2))
         except Exception:
-            pass  # never crash the app over config saving
+            pass
 
     def _load_config(self):
-        """Restore persistent state from JSON on startup."""
         try:
             if self.config_file.exists():
                 data = json.loads(self.config_file.read_text())
@@ -329,8 +401,6 @@ class ExtrapolationGUI:
                     self.factor_database_path.set(ef)
         except Exception:
             pass
-
-    # ── Styles ────────────────────────────────────────────────────────────────
 
     def _build_styles(self):
         s = ttk.Style()
@@ -357,8 +427,6 @@ class ExtrapolationGUI:
         s.configure('Modern.Horizontal.TProgressbar',
                     background=self.ACCENT, troughcolor=self.BG_MAIN,
                     borderwidth=0, thickness=8)
-
-    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         main = ttk.Frame(self.root, style='Modern.TFrame')
@@ -387,7 +455,6 @@ class ExtrapolationGUI:
         canvas.pack(side='left', fill='both', expand=True)
         scroll_frame.columnconfigure(0, weight=1)
 
-        # ── Title
         title_f = ttk.Frame(scroll_frame, style='Modern.TFrame', padding='20 20 20 10')
         title_f.grid(row=0, column=0, sticky='ew')
         ttk.Label(title_f, text='Extrapolation',
@@ -398,7 +465,6 @@ class ExtrapolationGUI:
                   font=('Segoe UI', 11), foreground=self.TEXT_LITE,
                   background=self.BG_MAIN).pack(anchor='w', pady=(5, 0))
 
-        # ── File selection card
         file_f = ttk.LabelFrame(scroll_frame, style='Card.TLabelframe',
                                 text='File Selection', padding='20')
         file_f.grid(row=1, column=0, sticky='ew', padx=0, pady=(0, 1))
@@ -429,19 +495,15 @@ class ExtrapolationGUI:
         _file_row(file_f, 'Historic Features (Optional):', self.historic_features_path, 2,
                   browse_cmd=self._browse_historic_features,
                   template_cmd=self._export_historic_features_template)
-
-        # Factor Database row — persists across uploads until user changes it
         _file_row(file_f, 'Factor Database (Optional):', self.factor_database_path, 3,
                   browse_cmd=self._browse_factor_database)
 
-        # Clear factor database button
         clear_ef_row = tk.Frame(file_f, bg=self.BG_CARD)
         clear_ef_row.grid(row=3, column=3, padx=(4, 0), pady=2, sticky='w')
         ttk.Button(clear_ef_row, text='✕ Clear',
                    command=lambda: [self.factor_database_path.set(''), self._save_config()],
                    style='Template.TButton', width=8).pack(side='left')
 
-        # ── Features row (below file rows, spanning full width)
         feat_row = tk.Frame(file_f, bg=self.BG_CARD)
         feat_row.grid(row=4, column=0, columnspan=4, sticky='ew', pady=(8, 4))
 
@@ -461,9 +523,7 @@ class ExtrapolationGUI:
             font=('Segoe UI', 8), fg=self.DANGER, bg=self.BG_CARD,
             relief='flat', cursor='hand2',
             command=self._reset_features)
-        # Only shown when features have been manually selected
 
-        # ── About card
         about_f = ttk.LabelFrame(scroll_frame, style='Card.TLabelframe',
                                  text='About This Tool', padding='20')
         about_f.grid(row=2, column=0, sticky='ew', padx=0, pady=1)
@@ -474,25 +534,26 @@ class ExtrapolationGUI:
             "Required Input Columns:\n"
             "    \u2022 Site identifier (or Location if no site ID)\n"
             "    \u2022 Date from and Date to (DD/MM/YYYY or YYYY-MM-DD)\n"
-            "    \u2022 Volumetric Quantity (with blank values to extrapolate)\n\n"
+            "    \u2022 Volumetric Quantity (with blank values to extrapolate)\n"
+            "    \u2022 GHG Category (required; GHG Sub Category optional)\n\n"
+            "Multiple GHG Categories:\n"
+            "    If more than one category has blank rows, a popup will ask you\n"
+            "    to select the target. All other categories become features automatically.\n\n"
             "Optional \u2014 To Improve Predictions:\n"
             "    \u2022 Any numeric feature columns (e.g. Turnover, Floor Space, kWh)\n"
             "    \u2022 Categorical feature columns (e.g. Brand)\n"
             "    \u2022 Historic Records: Previous years' volumetric quantities\n"
             "    \u2022 Historic Features: Previous years' feature values by site\n\n"
-            "Use 'Select Features' to choose which columns act as predictive features, "
-            "or leave on auto-detect.\n\n"
             "Output Sheets:\n"
-            "    1. Complete Carbon Records \u2014 all rows with filled VQ + integrity + method + quality score\n"
-            "    2. Data Availability \u2014 per-row summary of site, month, features, historic data\n"
-            "    3. Statistical Analysis \u2014 all stat tests with R\u00b2 and p-values\n"
-            "    4. Machine Learning Models \u2014 CV R\u00b2, train/test row counts, data sources\n"
-            "    5. YoY Analysis \u2014 site-by-site comparison with historic data (if provided)"
+            "    1. Complete Carbon Records\n"
+            "    2. Data Availability\n"
+            "    3. Statistical Analysis\n"
+            "    4. Machine Learning Models\n"
+            "    5. YoY Analysis (if historic records provided)"
         )
         ttk.Label(about_f, text=about_text, justify='left',
                   font=('Segoe UI', 9), foreground=self.TEXT_DARK).pack(anchor='w')
 
-        # ── Progress
         prog_f = ttk.Frame(scroll_frame, style='Modern.TFrame', padding='20 15')
         prog_f.grid(row=3, column=0, sticky='ew')
         self.progress_bar = ttk.Progressbar(
@@ -505,7 +566,6 @@ class ExtrapolationGUI:
             font=('Segoe UI', 11, 'bold'))
         self.status_label.pack(pady=8)
 
-        # ── Action buttons
         btn_f = ttk.Frame(scroll_frame, style='Modern.TFrame', padding='0 10 20 15')
         btn_f.grid(row=4, column=0, sticky='ew')
         self.process_btn = ttk.Button(
@@ -515,7 +575,6 @@ class ExtrapolationGUI:
         ttk.Button(btn_f, text='Clear Log', command=self._clear_log,
                    style='Modern.TButton', width=18).pack(side='left', padx=5)
 
-        # ── Log
         log_f = ttk.LabelFrame(scroll_frame, style='Card.TLabelframe',
                                text='Processing Log', padding='20')
         log_f.grid(row=5, column=0, sticky='ewns', padx=0, pady=(1, 0))
@@ -590,8 +649,10 @@ class ExtrapolationGUI:
             filetypes=[('Excel/CSV', '*.xlsx *.xls *.csv'), ('All files', '*.*')])
         if path:
             self.input_file_path.set(path)
-            # Clear any manually selected features when a new file is loaded
             self._reset_features()
+            # Clear any previously chosen target category when a new file is loaded
+            self.target_ghg     = None
+            self.target_ghg_sub = None
             print(f"\n✓ Input file selected: {os.path.basename(path)}\n")
 
     def _browse_historic_records(self):
@@ -714,8 +775,7 @@ class ExtrapolationGUI:
 
     def _set_status(self, msg, colour='black'):
         colours = {'green': self.SUCCESS, 'blue': self.ACCENT, 'red': self.DANGER}
-        self.status_label.config(text=msg,
-                                 foreground=colours.get(colour, colour))
+        self.status_label.config(text=msg, foreground=colours.get(colour, colour))
 
     # ── Processing ────────────────────────────────────────────────────────────
 
@@ -727,6 +787,29 @@ class ExtrapolationGUI:
             messagebox.showerror('Error', 'Please select an input data file.')
             return
 
+        # ── Category pre-flight ───────────────────────────────────────────────
+        # If multiple categories have blanks and user hasn't selected a target,
+        # show the picker before spawning the processing thread.
+        if self.target_ghg is None:
+            try:
+                cats_with_blanks = scan_categories_with_blanks(self.input_file_path.get())
+            except Exception as e:
+                messagebox.showerror('Error scanning file', str(e))
+                return
+
+            if len(cats_with_blanks) > 1:
+                dlg = CategoryPickerDialog(self.root, cats_with_blanks)
+                self.root.wait_window(dlg)
+                if dlg.cancelled:
+                    return  # user cancelled — don't start processing
+                self.target_ghg     = dlg.result_ghg
+                self.target_ghg_sub = dlg.result_ghg_sub
+                tgt = self.target_ghg + (' ' + self.target_ghg_sub if self.target_ghg_sub else '')
+                print(f"\n✓ Target category selected: {tgt.strip()}")
+                print(f"  All other categories will be used as features.\n")
+            # If 0 or 1 category with blanks, target_ghg stays None and
+            # ExtrapolationTool resolves it automatically during load().
+
         self.is_processing = True
         self.process_btn.config(state='disabled')
         self.progress_bar.start()
@@ -736,20 +819,9 @@ class ExtrapolationGUI:
         thread.start()
 
     def _apply_factor_database(self, complete_df, factor_db_path):
-        """
-        Three jobs:
-        1. Strip internal Cross-cat feature columns — these are computation
-           artefacts, not carbon records fields, and must not appear in output.
-        2. Use the factor database as a COLUMN TEMPLATE — the output columns
-           follow the factor DB column order exactly. Any input column not in
-           the factor DB is appended at the end.
-        3. Left-join factor rows onto the output where keys match, filling in
-           emission factor values (EF kgCO2e FU, tCO2e, etc.).
-        """
         try:
             print("\n  Applying factor database as column template + lookup...")
 
-            # ── Step 1: strip internal cross-category feature columns ─────────
             cross_cat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
             if cross_cat_cols:
                 complete_df = complete_df.drop(columns=cross_cat_cols)
@@ -761,7 +833,6 @@ class ExtrapolationGUI:
                 ef_df = pd.read_excel(factor_db_path)
             ef_df.columns = ef_df.columns.str.strip()
 
-            # Columns that are factor values — never join on these
             value_cols = {
                 'Volumetric Quantity', 'Data integrity', 'Estimation Method',
                 'Data Quality Score', 'kgCO2e', 'tCO2e',
@@ -773,14 +844,11 @@ class ExtrapolationGUI:
                 'kg CO2e of N2O per unit',
             }
 
-            # ── Step 2: establish join keys ───────────────────────────────────
             join_keys = [
                 c for c in ef_df.columns
                 if c in complete_df.columns and c not in value_cols
                 and ef_df[c].notna().mean() > 0.5
             ]
-
-            # ── Step 3: join factor values where keys match ────────────────────
             new_ef_cols = [c for c in ef_df.columns if c not in complete_df.columns]
             print(f"  Join keys: {join_keys if join_keys else 'none found'}")
             print(f"  New columns from factor DB: {len(new_ef_cols)}")
@@ -796,113 +864,18 @@ class ExtrapolationGUI:
                 for col in new_ef_cols:
                     merged[col] = np.nan
             else:
-                print("  ⚠  Factor database has no new columns — stripping cross-cat only")
+                print("  ⚠  Factor database has no new columns")
                 merged = complete_df.copy()
 
-            # ── Step 4: enforce EXACT factor DB column order ──────────────────
-            # Factor DB columns come first in their exact order.
-            # Any remaining input columns not in the factor DB are appended after.
             ef_col_order    = list(ef_df.columns)
             remaining_input = [c for c in complete_df.columns if c not in ef_col_order]
             final_order     = ef_col_order + remaining_input
-            merged = merged[[c for c in final_order if c in merged.columns]]
-
-            return merged
+            return merged[[c for c in final_order if c in merged.columns]]
 
         except Exception as e:
             print(f"  ⚠  Factor database error: {e} — output unchanged")
-            # Still strip cross-cat columns even if factor DB fails
             cross_cat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
             return complete_df.drop(columns=cross_cat_cols, errors='ignore')
-
-    def _build_xcat_sheet(self, complete_df, tool):
-        """
-        Build the Cross-Category Features explanation sheet.
-        Shows each injected feature, how it was calculated, its correlation
-        with VQ in the training data, and whether it was actually selected
-        as the best prediction method for any rows.
-        """
-        xcat_cols = [c for c in complete_df.columns if c.startswith('Cross-cat:')]
-        if not xcat_cols:
-            return None
-
-        rows = []
-        # Which methods were actually used in predictions?
-        used_methods = set()
-        if 'Estimation Method' in complete_df.columns:
-            used_methods = set(complete_df['Estimation Method'].dropna().unique())
-
-        for col in xcat_cols:
-            # Parse the label: "Cross-cat: Electricity (Location Based) | fleet index"
-            label = col.replace('Cross-cat: ', '')
-            if ' | ' in label:
-                category_part, metric_part = label.split(' | ', 1)
-            else:
-                category_part, metric_part = label, ''
-
-            is_fleet     = 'fleet index' in metric_part
-            is_intensity = 'intensity'   in metric_part
-
-            if is_fleet:
-                how_calculated = (
-                    f"Site's annual {category_part} VQ ÷ fleet mean annual {category_part} VQ. "
-                    f"Value of 1.0 = average; >1.0 = above average consumer; <1.0 = below average. "
-                    f"Annualised: monthly data scaled to 12 months before computing."
-                )
-            elif is_intensity:
-                how_calculated = (
-                    f"Site's annual {category_part} VQ ÷ site's annual Turnover. "
-                    f"Dimensionless ratio — comparable across sites regardless of size. "
-                    f"Annualised: monthly data scaled to 12 months before computing."
-                )
-            else:
-                how_calculated = f"Derived from {category_part} VQ."
-
-            # Correlation with VQ in known rows
-            pearson_r, spearman_r, fill_pct = '', '', ''
-            if col in tool.df.columns and tool.vq_col in tool.df.columns:
-                known = tool.df[tool.df[tool.vq_col].notna() & tool.df[col].notna()]
-                n = len(known)
-                fill_pct = f"{n}/{len(tool.df)} rows ({n/len(tool.df)*100:.0f}%)"
-                if n >= 4:
-                    try:
-                        pr = known[col].corr(known[tool.vq_col], method='pearson')
-                        sr = known[col].corr(known[tool.vq_col], method='spearman')
-                        pearson_r  = f"{pr:.3f}" if pd.notna(pr) else ''
-                        spearman_r = f"{sr:.3f}" if pd.notna(sr) else ''
-                    except Exception:
-                        pass
-
-            # Check if used directly or as part of an Intensity_ or ML method
-            intensity_method = f'Intensity_{col}'
-            used_directly = (
-                intensity_method in used_methods
-                or any(col in m for m in used_methods if 'ML' in m or 'GBT' in m or 'RF' in m)
-            )
-            # Also check stat_methods for the effective R2
-            stat_info = tool.stat_methods.get(intensity_method, {})
-            eff_r2 = stat_info.get('effective_r2', '')
-            if eff_r2 != '':
-                eff_r2 = f"{eff_r2:.4f}"
-
-            rows.append({
-                'Feature Name':        col,
-                'GHG Category':        category_part,
-                'Metric Type':         'Fleet Index' if is_fleet else 'Turnover Intensity',
-                'How Calculated':      how_calculated,
-                'Data Fill Rate':      fill_pct,
-                'Pearson r vs VQ':     pearson_r,
-                'Spearman r vs VQ':    spearman_r,
-                'Effective R² (stat)': eff_r2,
-                'Used in Predictions': 'Yes' if used_directly else 'No',
-                'Note': (
-                    "Fleet index is dimensionless — a ratio relative to portfolio average. "
-                    "Intensity is VQ per unit of Turnover. Neither uses raw VQ directly, "
-                    "so cross-unit contamination (kWh vs litres) is avoided."
-                ),
-            })
-
-        return pd.DataFrame(rows)
 
     def _run(self):
         try:
@@ -917,18 +890,15 @@ class ExtrapolationGUI:
                 historic_features_file=hist_feat,
                 forced_numeric_features=self.selected_numeric_features,
                 forced_categorical_features=self.selected_categorical_features,
+                target_ghg=self.target_ghg,
+                target_ghg_sub=self.target_ghg_sub,
             )
 
             complete, avail, stat, ml, cat_bkd, yoy = tool.run()
 
-            # ── Build cross-category features sheet (before stripping cols) ───
-            xcat_sheet = self._build_xcat_sheet(complete, tool)
-
-            # ── Apply factor database (also strips cross-cat cols + reorders) ─
             if factor_db:
                 complete = self._apply_factor_database(complete, factor_db)
             else:
-                # No factor DB — just strip the internal cross-cat columns
                 cross_cat_cols = [c for c in complete.columns if c.startswith('Cross-cat:')]
                 if cross_cat_cols:
                     complete = complete.drop(columns=cross_cat_cols)
@@ -942,7 +912,6 @@ class ExtrapolationGUI:
 
             with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
                 sheet_num = 1
-
                 complete.to_excel(writer, sheet_name='Complete Carbon Records', index=False)
                 print(f"✓ Sheet {sheet_num}: Complete Carbon Records ({len(complete)} rows)")
                 sheet_num += 1
@@ -977,15 +946,14 @@ class ExtrapolationGUI:
                 else:
                     print("  (YoY Analysis sheet skipped — no historic records provided)")
 
-                if xcat_sheet is not None and len(xcat_sheet):
-                    xcat_sheet.to_excel(writer, sheet_name='Cross-Category Features', index=False)
-                    print(f"✓ Sheet {sheet_num}: Cross-Category Features ({len(xcat_sheet)} features)")
-                    sheet_num += 1
-
             print(f"\n✓ Output saved to:\n  {output_file}\n")
             print('=' * 60)
             print('PROCESSING COMPLETE!')
             print('=' * 60)
+
+            # Reset target for next run (in case user loads a new file)
+            self.target_ghg     = None
+            self.target_ghg_sub = None
 
             self.root.after(0, lambda: self._set_status('Processing complete!', 'green'))
             self.root.after(0, lambda: messagebox.showinfo(
