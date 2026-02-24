@@ -1242,6 +1242,60 @@ class ExtrapolationTool:
                           None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                           _eff_r2(pr2, sr2, kr2), _mtype='Historic_Direct')
 
+            # 8 – Historic YoY site delta
+            # For each site with ≥3 known current-year monthly rows AND matching
+            # historic monthly rows, compute the mean YoY % change across those
+            # known months. Predict each known month by leave-one-out: compute
+            # delta from the OTHER known months, apply to that month's historic VQ.
+            # Fleet R² is accumulated across all sites that qualify.
+            # _site_yoy_deltas stored for use in predict_row: {site: delta_ratio}
+            site_yoy_deltas = {}   # {site: mean ratio current/historic across known months}
+            pd_all, ad_all  = [], []
+
+            for site, site_grp in mn.groupby(self.site_col):
+                site = str(site).strip()
+                ckey_example = self._composite_key(site_grp.iloc[0])
+
+                # Collect matched month pairs: (current_vq, historic_vq)
+                pairs = []
+                for _, row in site_grp.iterrows():
+                    month = row['_Month']
+                    if not month:
+                        continue
+                    ckey = self._composite_key(row)
+                    hvq  = self.historic_vq.get(ckey, {}).get(month)
+                    if hvq is not None and hvq > 0:
+                        pairs.append((float(row[self.vq_col]), float(hvq), month))
+
+                if len(pairs) < 3:
+                    continue
+
+                # Overall site delta ratio (current / historic mean)
+                ratios = [p[0] / p[1] for p in pairs]
+                site_yoy_deltas[site] = float(np.mean(ratios))
+
+                # Leave-one-out cross-validation for fleet R²
+                for i, (curr_vq, hist_vq, _) in enumerate(pairs):
+                    other_ratios = [pairs[j][0] / pairs[j][1]
+                                    for j in range(len(pairs)) if j != i]
+                    loo_delta = float(np.mean(other_ratios))
+                    pd_all.append(hist_vq * loo_delta)
+                    ad_all.append(curr_vq)
+
+            if len(pd_all) >= 4:
+                pd_arr, ad_arr = np.array(pd_all, float), np.array(ad_all, float)
+                pr, pr2, pp = _pearson(pd_arr, ad_arr)
+                sr, sr2, sp = _spearman(pd_arr, ad_arr)
+                kr, kr2, kp = _kendall(pd_arr, ad_arr)
+                n_sites = len(site_yoy_deltas)
+                self._reg('Historic_YoY_SiteDelta',
+                          f'Historic VQ × site mean YoY ratio (LOO CV, {n_sites} sites)',
+                          f'{len(pd_all)} monthly rows across {n_sites} qualifying sites',
+                          None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                          _eff_r2(pr2, sr2, kr2),
+                          _mtype='Historic_YoY_SiteDelta',
+                          _site_yoy_deltas=site_yoy_deltas)
+
         print(f"  {len(self.stat_methods)} stat/rule methods registered")
         self._run_trajectory_tests()
 
@@ -1408,7 +1462,7 @@ class ExtrapolationTool:
         for cat in self.categorical_features:
             sub = self.known[self.known[cat].notna()]
             if len(sub) >= 6:
-                self._train_subset(sub, ['_Month'] + self.numeric_features,
+                self._train_subset(sub, ['_Month'] + self.numeric_features + [cat],
                                    f'By_{cat}', [cat] + self.categorical_features)
 
         print(f"  {len(self.ml_models)} ML models trained")
@@ -1589,7 +1643,18 @@ class ExtrapolationTool:
                 anchor_r2 = self.stat_methods.get('Historic_LastYear_Direct',
                             {}).get('effective_r2', 0.35)
 
-                best_adj_r2 = 0.0
+                best_adj_r2 = anchor_r2  # only upgrade if adjusted method is actually better
+
+                # Check site-specific YoY delta first — competes on fleet R²
+                yoy_info   = self.stat_methods.get('Historic_YoY_SiteDelta', {})
+                yoy_r2     = yoy_info.get('effective_r2', 0.0)
+                site_delta = yoy_info.get('_site_yoy_deltas', {}).get(site)
+                if site_delta is not None and yoy_r2 > best_adj_r2 and specific_month:
+                    anchor        = float(hval) * site_delta
+                    anchor_method = 'Historic_YoY_SiteDelta'
+                    anchor_r2     = yoy_r2
+                    best_adj_r2   = yoy_r2
+
                 for feat in self.numeric_features:
                     cf = row.get(feat)
                     hf = self.historic_feats.get(site, {}).get(feat)
@@ -1878,20 +1943,11 @@ class ExtrapolationTool:
                                for fc in info['features'])
             r2_raw = info['r2']
             if r2_raw is None or (isinstance(r2_raw, float) and np.isnan(r2_raw)):
-                cv_r2, reliability = None, 'R² undefined — n too small for CV'
-            elif r2_raw < 0:
-                cv_r2, reliability = round(r2_raw, 4), 'Negative R² — worse than mean (overfitting)'
-            elif r2_raw < 0.1:
-                cv_r2, reliability = round(r2_raw, 4), 'Very weak'
-            elif r2_raw < 0.3:
-                cv_r2, reliability = round(r2_raw, 4), 'Weak'
-            elif r2_raw < 0.6:
-                cv_r2, reliability = round(r2_raw, 4), 'Moderate'
+                cv_r2 = None
             else:
-                cv_r2, reliability = round(r2_raw, 4), 'Good'
+                cv_r2 = round(r2_raw, 4)
             rows.append({
                 'Model': name, 'Type': info['type'], 'CV_R2': cv_r2,
-                'Reliability': reliability, 'Features_Used': feats,
                 'N_Features': len(info['features']),
                 'N_Train_Rows': info.get('n_train', ''),
                 'N_Test_Rows_Per_Fold': info.get('n_test_per_fold', ''),
