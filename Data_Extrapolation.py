@@ -1116,7 +1116,7 @@ class ExtrapolationTool:
             pr, pr2, pp = _pearson(preds, acts)
             sr, sr2, sp = _spearman(preds, acts)
             kr, kr2, kp = _kendall(preds, acts)
-            self._reg('Site_Average', 'Site average VQ (monthly)', f'{len(mn)} monthly rows',
+            self._reg('Site Average', 'Site average VQ (monthly)', f'{len(mn)} monthly rows',
                       None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                       _eff_r2(pr2, sr2, kr2), _site_avgs=sa.to_dict())
 
@@ -1128,7 +1128,7 @@ class ExtrapolationTool:
                              for _, r in mn.iterrows()], float)
             a2   = mn[self.vq_col].values.astype(float)
             pr, pr2, pp = _pearson(p2, a2); sr, sr2, sp = _spearman(p2, a2); kr, kr2, kp = _kendall(p2, a2)
-            self._reg('Site_Average_Seasonal', 'Site average VQ x seasonal factor',
+            self._reg('Site Average × Seasonal', 'Site average VQ × seasonal factor',
                       f'{len(mn)} monthly rows',
                       None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                       _eff_r2(pr2, sr2, kr2), _site_avgs=sa2, _seasonal=True)
@@ -1140,7 +1140,7 @@ class ExtrapolationTool:
             p3 = np.array([v for v in preds3 if v is not None], float)
             a3 = mn[self.vq_col].values[:len(p3)].astype(float)
             pr, pr2, pp = _pearson(p3, a3); sr, sr2, sp = _spearman(p3, a3); kr, kr2, kp = _kendall(p3, a3)
-            self._reg('Seasonal_Average', 'Cross-site mean VQ per calendar month',
+            self._reg('Fleet Seasonal Average', 'Cross-site mean VQ per calendar month',
                       f'{len(mn)} monthly rows',
                       None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                       _eff_r2(pr2, sr2, kr2), _month_avgs=ma)
@@ -1148,7 +1148,7 @@ class ExtrapolationTool:
         # 4 – Overall average fallback
         for sub, lbl in [(self.known, 'all'), (an, 'annual')]:
             if len(sub) >= 4:
-                self._reg(f'Overall_Average_{lbl}', f'Overall mean {lbl} VQ', f'{len(sub)} rows',
+                self._reg(f'Fleet Overall Average ({lbl})', f'Overall mean {lbl} VQ', f'{len(sub)} rows',
                           None, None, None, None, None, None, None, None, None, None,
                           None, None, None, 0.0, _avg=float(sub[self.vq_col].mean()))
                 break
@@ -1165,7 +1165,7 @@ class ExtrapolationTool:
             slope = float(np.nanmedian(ratios)) if np.any(np.isfinite(ratios)) else None
             pr, pr2, pp = _pearson(fv, vq); sr, sr2, sp = _spearman(fv, vq); kr, kr2, kp = _kendall(fv, vq)
             eff = _eff_r2(pr2, sr2, kr2)
-            self._reg(f'Intensity_{feat}', f'VQ ~ {feat} intensity',
+            self._reg(f'Intensity Ratio (VQ/{feat})', f'Intensity ratio VQ/{feat}',
                       f'{len(pool)} rows',
                       slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None, eff,
                       _feat=feat, _mtype='Feature_Intensity')
@@ -1177,7 +1177,7 @@ class ExtrapolationTool:
                 as_ = pm[self.vq_col].values.astype(float)
                 if len(ps) >= 4:
                     pr, pr2, pp = _pearson(ps, as_); sr, sr2, sp = _spearman(ps, as_); kr, kr2, kp = _kendall(ps, as_)
-                    self._reg(f'Intensity_{feat}_Seasonal', f'VQ ~ {feat} intensity x seasonal',
+                    self._reg(f'Intensity Ratio (VQ/{feat}) × Seasonal', f'Intensity ratio VQ/{feat} × seasonal',
                               f'{len(ps)} monthly rows',
                               slope, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                               _eff_r2(pr2, sr2, kr2),
@@ -1191,7 +1191,7 @@ class ExtrapolationTool:
             vq    = pool[self.vq_col].values.astype(float)
             codes = pd.Categorical(pool[feat]).codes.astype(float)
             pbr, pbr2, pbp = _pointbiserial(codes, vq)
-            self._reg(f'Categorical_{feat}', f'Group mean VQ by {feat}',
+            self._reg(f'Group Mean VQ ({feat})', f'Group mean VQ by {feat}',
                       f'{len(pool)} rows',
                       None, None, None, None, None, None, None, None, None, None,
                       pbr, pbr2, pbp, _eff_r2(None, None, pbr2=pbr2),
@@ -1223,8 +1223,8 @@ class ExtrapolationTool:
                 if len(preds_h) >= 4:
                     ph, ah = np.array(preds_h, float), np.array(acts_h, float)
                     pr, pr2, pp = _pearson(ph, ah); sr, sr2, sp = _spearman(ph, ah); kr, kr2, kp = _kendall(ph, ah)
-                    self._reg(f'Historic_Adjusted_{feat}',
-                              f'Historic VQ x ({feat} ratio)', f'{len(preds_h)} rows',
+                    self._reg(f'Historic Direct × {feat} Ratio',
+                              f'Historic VQ × {feat} ratio', f'{len(preds_h)} rows',
                               None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                               _eff_r2(pr2, sr2, kr2), _feat=feat, _mtype='Historic_Adjusted')
 
@@ -1237,10 +1237,10 @@ class ExtrapolationTool:
             if len(pl) >= 4:
                 pla, ala = np.array(pl, float), np.array(al, float)
                 pr, pr2, pp = _pearson(pla, ala); sr, sr2, sp = _spearman(pla, ala); kr, kr2, kp = _kendall(pla, ala)
-                self._reg('Historic_LastYear_Direct', 'Same calendar month previous year',
+                self._reg('Historic Direct (Same Month)', 'Same calendar month previous year',
                           f'{len(pl)} monthly rows',
                           None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
-                          _eff_r2(pr2, sr2, kr2), _mtype='Historic_Direct')
+                          _eff_r2(pr2, sr2, kr2), _mtype='Historic Direct')
 
             # 8 – Historic YoY site delta
             # For each site with ≥3 known current-year monthly rows AND matching
@@ -1288,12 +1288,12 @@ class ExtrapolationTool:
                 sr, sr2, sp = _spearman(pd_arr, ad_arr)
                 kr, kr2, kp = _kendall(pd_arr, ad_arr)
                 n_sites = len(site_yoy_deltas)
-                self._reg('Historic_YoY_SiteDelta',
+                self._reg('Historic Direct × Site YoY Trend',
                           f'Historic VQ × site mean YoY ratio (LOO CV, {n_sites} sites)',
                           f'{len(pd_all)} monthly rows across {n_sites} qualifying sites',
                           None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
                           _eff_r2(pr2, sr2, kr2),
-                          _mtype='Historic_YoY_SiteDelta',
+                          _mtype='Historic Direct × Site YoY Trend',
                           _site_yoy_deltas=site_yoy_deltas)
 
         print(f"  {len(self.stat_methods)} stat/rule methods registered")
@@ -1525,21 +1525,33 @@ class ExtrapolationTool:
             ('Gradient_Boosting',     GradientBoostingRegressor(n_estimators=100, random_state=42,
                                                                   max_depth=5)),
         ]:
-            key = f'{prefix}_{mname}'
+            # Build human-readable model name
+            _mtype = mname.replace('_', ' ').title()
+            _mtype = _mtype.replace('Linear Regression', 'Multiple Linear Regression')\
+                           .replace('Polynomial Regression', 'Polynomial Regression')\
+                           .replace('Random Forest', 'Random Forest')\
+                           .replace('Gradient Boosting', 'Gradient Boosting')
+            # Extract categorical qualifier from prefix if present
+            _cat_qualifier = ''
+            if prefix.startswith('By_'):
+                _cat_name = prefix[3:]  # strip 'By_'
+                _cat_qualifier = f' ({_cat_name})'
+            key = f'{prefix}_{mname}'   # keep internal key stable for deduplication
+            _display_key = f'{_mtype}{_cat_qualifier}'
             r2, n_train, n_test, n_folds, cv_type = _cv_r2_with_meta(mobj, X, y)
             try:
                 mobj.fit(X, y)
             except Exception:
                 continue
-            self.ml_models[key] = dict(
+            self.ml_models[_display_key] = dict(
                 model=mobj, features=valid, encoders=encoders,
-                r2=float(r2), type=mname.replace('_', ' '),
+                r2=float(r2), type=_mtype,
                 description=f'{mname.replace("_"," ")} using {feat_label}. CV R2={r2:.3f} (n={n_train})',
                 n_train=n_train, n_test_per_fold=n_test, n_folds=n_folds, cv_type=cv_type,
                 data_sources=getattr(self, '_data_sources_label', ''),
                 predictions_made=0,
             )
-            print(f"  {'✓' if r2>=0.3 else '~'} {key}: R2={r2:.4f} "
+            print(f"  {'✓' if r2>=0.3 else '~'} {_display_key}: R2={r2:.4f} "
                   f"[train={n_train}, test/fold={n_test}, {cv_type}]")
 
     # ── Prediction ────────────────────────────────────────────────────────────
@@ -1614,9 +1626,9 @@ class ExtrapolationTool:
         site_known = self.known[self.known[self.site_col].astype(str).str.strip() == site]
         if len(site_known) > 0:
             anchor        = float(site_known[self.vq_col].mean())
-            anchor_method = 'Site_Average_Seasonal'
-            anchor_r2     = self.stat_methods.get('Site_Average_Seasonal',
-                            self.stat_methods.get('Site_Average', {})
+            anchor_method = 'Site Average × Seasonal'
+            anchor_r2     = self.stat_methods.get('Site Average × Seasonal',
+                            self.stat_methods.get('Site Average', {})
                             ).get('effective_r2', 0.6)
 
         # ── Tier 2: historic target-category data for this site ───────────────
@@ -1633,25 +1645,25 @@ class ExtrapolationTool:
                     yf = self.current_year - self.historic_year
                     if yf > 0:
                         hval = hval * (growth ** yf)
-                        anchor_method = 'Historic_GrowthProjected'
+                        anchor_method = 'Historic Direct (Growth Projected)'
                     else:
-                        anchor_method = 'Historic_Direct'
+                        anchor_method = 'Historic Direct'
                 else:
-                    anchor_method = 'Historic_Direct'
+                    anchor_method = 'Historic Direct'
 
                 anchor    = float(hval)
-                anchor_r2 = self.stat_methods.get('Historic_LastYear_Direct',
+                anchor_r2 = self.stat_methods.get('Historic Direct (Same Month)',
                             {}).get('effective_r2', 0.35)
 
                 best_adj_r2 = anchor_r2  # only upgrade if adjusted method is actually better
 
                 # Check site-specific YoY delta first — competes on fleet R²
-                yoy_info   = self.stat_methods.get('Historic_YoY_SiteDelta', {})
+                yoy_info   = self.stat_methods.get('Historic Direct × Site YoY Trend', {})
                 yoy_r2     = yoy_info.get('effective_r2', 0.0)
                 site_delta = yoy_info.get('_site_yoy_deltas', {}).get(site)
                 if site_delta is not None and yoy_r2 > best_adj_r2 and specific_month:
                     anchor        = float(hval) * site_delta
-                    anchor_method = 'Historic_YoY_SiteDelta'
+                    anchor_method = 'Historic Direct × Site YoY Trend'
                     anchor_r2     = yoy_r2
                     best_adj_r2   = yoy_r2
 
@@ -1664,14 +1676,14 @@ class ExtrapolationTool:
                     if not (0.1 <= ratio <= 10.0):
                         continue
                     adj_r2 = self.stat_methods.get(
-                        f'Historic_Adjusted_{feat}', {}).get('effective_r2', 0.0)
+                        f'Historic Direct × {feat} Ratio', {}).get('effective_r2', 0.0)
                     if adj_r2 > best_adj_r2:
                         anchor        = float(hval) * ratio
-                        anchor_method = f'Historic_Adjusted_{feat}'
+                        anchor_method = f'Historic Direct × {feat} Ratio'
                         anchor_r2     = adj_r2
                         best_adj_r2   = adj_r2
 
-                if specific_month and anchor_method in ('Historic_Direct', 'Historic_GrowthProjected'):
+                if specific_month and anchor_method in ('Historic Direct', 'Historic Direct (Growth Projected)'):
                     sf   = self._seasonal_factor(site, month)
                     pred = self._clip(anchor * sf, lo, hi)
                     return (pred if pred is not None
@@ -1683,13 +1695,13 @@ class ExtrapolationTool:
             # 3a: categorical group mean
             for feat in self.categorical_features:
                 cv   = row.get(feat)
-                info = self.stat_methods.get(f'Categorical_{feat}', {})
+                info = self.stat_methods.get(f'Group Mean VQ ({feat})', {})
                 cm   = info.get('_cat_means', {})
                 if pd.isna(cv) or cv not in cm:
                     continue
                 r2 = info.get('effective_r2', 0.0)
                 if r2 > anchor_r2:
-                    anchor, anchor_method, anchor_r2 = float(cm[cv]), f'Categorical_{feat}', r2
+                    anchor, anchor_method, anchor_r2 = float(cm[cv]), f'Group Mean VQ ({feat})', r2
 
             # 3b: ML models
             for name, info in self.ml_models.items():
@@ -1706,34 +1718,34 @@ class ExtrapolationTool:
 
             # 3c: feature intensity slope
             for feat in self.numeric_features:
-                info  = self.stat_methods.get(f'Intensity_{feat}', {})
+                info  = self.stat_methods.get(f'Intensity Ratio (VQ/{feat})', {})
                 slope = info.get('slope')
                 fval  = row.get(feat)
                 if slope is None or pd.isna(fval):
                     continue
                 r2 = info.get('effective_r2', 0.0)
                 if r2 > anchor_r2:
-                    anchor, anchor_method, anchor_r2 = float(fval) * slope, f'Intensity_{feat}', r2
+                    anchor, anchor_method, anchor_r2 = float(fval) * slope, f'Intensity Ratio (VQ/{feat})', r2
 
             # 3d: cross-site seasonal average
             if anchor is None:
-                ma = self.stat_methods.get('Seasonal_Average', {}).get('_month_avgs', {})
+                ma = self.stat_methods.get('Fleet Seasonal Average', {}).get('_month_avgs', {})
                 v  = ma.get(month) if month else None
                 if v is not None:
                     pred = self._clip(float(v), lo, hi)
-                    r2   = self.stat_methods.get('Seasonal_Average', {}).get('effective_r2', 0.0)
+                    r2   = self.stat_methods.get('Fleet Seasonal Average', {}).get('effective_r2', 0.0)
                     return (pred if pred is not None
                             else float(self.known[self.vq_col].mean()),
-                            'Seasonal_Average', r2)
+                            'Fleet Seasonal Average', r2)
 
             if anchor is None:
-                return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+                return float(self.known[self.vq_col].mean()), 'Fleet Overall Average', 0.0
 
         # ── Stage 2: seasonal index ───────────────────────────────────────────
         sf         = self._seasonal_factor(site, month) if month else 1.0
         prediction = self._clip(anchor * sf, lo, hi)
         if prediction is None:
-            return float(self.known[self.vq_col].mean()), 'Overall_Average_fallback', 0.0
+            return float(self.known[self.vq_col].mean()), 'Fleet Overall Average', 0.0
 
         return prediction, anchor_method, anchor_r2
 
