@@ -1296,6 +1296,120 @@ class ExtrapolationTool:
                           _mtype='Historic Direct × Site YoY Trend',
                           _site_yoy_deltas=site_yoy_deltas)
 
+            # 9 – Fleet YoY delta
+            # Fleet-wide mean YoY ratio across ALL sites with ≥1 matched pair.
+            # Used for sites with no current-year data at all — applies the
+            # observed fleet trend to their historic figure.
+            # Cross-validated by leave-one-SITE-out: for each site's pairs,
+            # compute the delta from all OTHER sites and test against this site.
+            # Also computed per categorical feature group for finer matching.
+
+            # Collect all site ratios from ANY site with ≥1 matched pair
+            all_site_ratios = {}   # {site: mean_ratio}
+            for site_s, site_grp in mn.groupby(self.site_col):
+                site_s = str(site_s).strip()
+                pairs_s = []
+                for _, row in site_grp.iterrows():
+                    mo = row['_Month']
+                    if not mo:
+                        continue
+                    ck = self._composite_key(row)
+                    hv = self.historic_vq.get(ck, {}).get(mo)
+                    if hv is not None and hv > 0:
+                        pairs_s.append((float(row[self.vq_col]), float(hv)))
+                if pairs_s:
+                    all_site_ratios[site_s] = float(np.mean(
+                        [p[0] / p[1] for p in pairs_s]))
+
+            # Fleet delta = mean across all sites
+            # Median — robust to outlier sites (new openings, expansions, meter changes)
+            fleet_delta = float(np.median(list(all_site_ratios.values()))) if all_site_ratios else None
+
+            if fleet_delta is not None:
+                # Leave-one-SITE-out CV for R²
+                pf_all, af_all = [], []
+                sites_list = list(all_site_ratios.keys())
+                for site_s, site_grp in mn.groupby(self.site_col):
+                    site_s = str(site_s).strip()
+                    other_ratios = [v for k, v in all_site_ratios.items()
+                                    if k != site_s]
+                    if not other_ratios:
+                        continue
+                    loso_delta = float(np.median(other_ratios))
+                    for _, row in site_grp.iterrows():
+                        mo = row['_Month']
+                        if not mo:
+                            continue
+                        ck = self._composite_key(row)
+                        hv = self.historic_vq.get(ck, {}).get(mo)
+                        if hv is not None and hv > 0:
+                            pf_all.append(float(hv) * loso_delta)
+                            af_all.append(float(row[self.vq_col]))
+
+                if len(pf_all) >= 4:
+                    pf_arr, af_arr = np.array(pf_all, float), np.array(af_all, float)
+                    pr, pr2, pp = _pearson(pf_arr, af_arr)
+                    sr, sr2, sp = _spearman(pf_arr, af_arr)
+                    kr, kr2, kp = _kendall(pf_arr, af_arr)
+                    n_fleet = len(all_site_ratios)
+                    self._reg('Historic Direct × Fleet YoY Trend',
+                              f'Historic VQ × fleet mean YoY ratio (LOSO CV, {n_fleet} sites)',
+                              f'{len(pf_all)} monthly rows across {n_fleet} sites',
+                              None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                              _eff_r2(pr2, sr2, kr2),
+                              _mtype='Historic Direct × Fleet YoY Trend',
+                              _fleet_yoy_delta=fleet_delta,
+                              _all_site_ratios=all_site_ratios)
+
+                # Category-band versions — one per categorical feature
+                for cat_feat in self.categorical_features:
+                    if cat_feat not in mn.columns:
+                        continue
+                    for cat_val, cat_grp in mn.groupby(cat_feat):
+                        cat_val = str(cat_val).strip()
+                        # Sites in this category that have ratios
+                        cat_site_ratios = {
+                            str(s).strip(): r
+                            for s, r in all_site_ratios.items()
+                            if s in cat_grp[self.site_col].astype(str).str.strip().values
+                        }
+                        if len(cat_site_ratios) < 2:
+                            continue
+                        cat_delta = float(np.median(list(cat_site_ratios.values())))
+                        # LOSO CV within category
+                        pc_all, ac_all = [], []
+                        for site_s, site_grp2 in cat_grp.groupby(self.site_col):
+                            site_s = str(site_s).strip()
+                            other = [v for k, v in cat_site_ratios.items()
+                                     if k != site_s]
+                            if not other:
+                                continue
+                            loso_c = float(np.median(other))
+                            for _, row in site_grp2.iterrows():
+                                mo = row['_Month']
+                                if not mo:
+                                    continue
+                                ck = self._composite_key(row)
+                                hv = self.historic_vq.get(ck, {}).get(mo)
+                                if hv is not None and hv > 0:
+                                    pc_all.append(float(hv) * loso_c)
+                                    ac_all.append(float(row[self.vq_col]))
+                        if len(pc_all) >= 4:
+                            pca, aca = np.array(pc_all, float), np.array(ac_all, float)
+                            pr, pr2, pp = _pearson(pca, aca)
+                            sr, sr2, sp = _spearman(pca, aca)
+                            kr, kr2, kp = _kendall(pca, aca)
+                            method_key = f'Historic Direct × Fleet YoY Trend ({cat_feat}={cat_val})'
+                            self._reg(method_key,
+                                      f'Historic VQ × {cat_feat} group YoY ratio (LOSO CV)',
+                                      f'{len(pc_all)} rows, {cat_feat}={cat_val}',
+                                      None, pr, pr2, pp, sr, sr2, sp, kr, kr2, kp, None, None, None,
+                                      _eff_r2(pr2, sr2, kr2),
+                                      _mtype='Historic Direct × Fleet YoY Trend',
+                                      _fleet_yoy_delta=cat_delta,
+                                      _cat_feat=cat_feat, _cat_val=cat_val,
+                                      _all_site_ratios=cat_site_ratios)
+
         print(f"  {len(self.stat_methods)} stat/rule methods registered")
         self._run_trajectory_tests()
 
@@ -1439,6 +1553,59 @@ class ExtrapolationTool:
 
     # ── ML models ─────────────────────────────────────────────────────────────
 
+    def _build_ml_features(self, df):
+        """
+        Enrich a dataframe with two additional ML feature columns:
+
+          '_Historic_VQ' — last year VQ for this site, timeframe-adjusted:
+            Monthly row + historic monthly  → use exact month value
+            Monthly row + historic annual   → annual ÷ 12
+            Annual row  + historic annual   → use annual directly
+            Annual row  + historic monthly  → sum all months
+            No match                        → NaN (row excluded from that feature)
+
+          '_Site' — site identifier as a string category for label encoding,
+                    lets ML models learn site-level fixed effects.
+        """
+        out = df.copy()
+        out['_Site'] = out[self.site_col].astype(str).str.strip()
+
+        if not self.historic_vq:
+            out['_Historic_VQ'] = np.nan
+            return out
+
+        hvq_vals = []
+        for _, row in out.iterrows():
+            ckey = self._composite_key(row)
+            hist = self.historic_vq.get(ckey, {})
+            tf   = row.get('_Timeframe', '')
+            mo   = row.get('_Month', '')
+
+            if not hist:
+                hvq_vals.append(np.nan)
+                continue
+
+            if tf == 'Monthly' and mo:
+                if mo in hist:
+                    hvq_vals.append(float(hist[mo]))
+                elif 'ANNUAL' in hist:
+                    hvq_vals.append(float(hist['ANNUAL']) / 12.0)
+                else:
+                    month_vals = [v for k, v in hist.items() if k != 'ANNUAL']
+                    hvq_vals.append(float(np.mean(month_vals)) if month_vals else np.nan)
+            else:
+                # Annual or unknown — prefer ANNUAL key, else sum months
+                if 'ANNUAL' in hist:
+                    hvq_vals.append(float(hist['ANNUAL']))
+                else:
+                    month_vals = [v for k, v in hist.items() if k != 'ANNUAL']
+                    hvq_vals.append(float(sum(month_vals)) if month_vals else np.nan)
+
+        out['_Historic_VQ'] = hvq_vals
+        n_matched = sum(1 for v in hvq_vals if not np.isnan(v))
+        print(f"  ML feature _Historic_VQ: {n_matched}/{len(out)} rows matched")
+        return out
+
     def train_ml_models(self):
         print("\n" + "=" * 60)
         print("MACHINE LEARNING MODELS")
@@ -1451,19 +1618,27 @@ class ExtrapolationTool:
             data_sources.append(f'Historic features ({len(self.historic_feats)} sites)')
         self._data_sources_label = ' + '.join(data_sources)
 
-        mn = self.known[self.known['_Timeframe'] == 'Monthly']
+        # Enrich known rows with Historic VQ and Site identifier features
+        known_enriched = self._build_ml_features(self.known)
+        # _Site must appear in BOTH feat_cols and cat_cols so _train_subset
+        # picks it up in the loop and knows to label-encode it
+        num_feats = self.numeric_features + ['_Historic_VQ']
+        cat_feats = self.categorical_features + ['_Site']
+        all_feats = num_feats + ['_Site']   # _Site in feat_cols so it gets processed
+
+        mn = known_enriched[known_enriched['_Timeframe'] == 'Monthly']
 
         if len(mn) >= 6:
-            self._train_subset(mn, ['_Month'] + self.numeric_features,
-                               'Monthly', self.categorical_features)
-        if len(self.known) >= 6:
-            self._train_subset(self.known, self.numeric_features,
-                               'All', self.categorical_features)
+            self._train_subset(mn, ['_Month'] + all_feats,
+                               'Monthly', cat_feats)
+        if len(known_enriched) >= 6:
+            self._train_subset(known_enriched, all_feats,
+                               'All', cat_feats)
         for cat in self.categorical_features:
-            sub = self.known[self.known[cat].notna()]
+            sub = known_enriched[known_enriched[cat].notna()]
             if len(sub) >= 6:
-                self._train_subset(sub, ['_Month'] + self.numeric_features + [cat],
-                                   f'By_{cat}', [cat] + self.categorical_features)
+                self._train_subset(sub, ['_Month'] + all_feats + [cat],
+                                   f'By_{cat}', [cat] + cat_feats)
 
         print(f"  {len(self.ml_models)} ML models trained")
 
@@ -1657,7 +1832,7 @@ class ExtrapolationTool:
 
                 best_adj_r2 = anchor_r2  # only upgrade if adjusted method is actually better
 
-                # Check site-specific YoY delta first — competes on fleet R²
+                # Check site-specific YoY delta first — competes on R²
                 yoy_info   = self.stat_methods.get('Historic Direct × Site YoY Trend', {})
                 yoy_r2     = yoy_info.get('effective_r2', 0.0)
                 site_delta = yoy_info.get('_site_yoy_deltas', {}).get(site)
@@ -1666,6 +1841,41 @@ class ExtrapolationTool:
                     anchor_method = 'Historic Direct × Site YoY Trend'
                     anchor_r2     = yoy_r2
                     best_adj_r2   = yoy_r2
+
+                # Fleet YoY delta — fires when site has no own trend
+                # Try category-band version first, then fleet-wide
+                if site_delta is None and specific_month:
+                    # Category-band: find best matching category group for this site
+                    best_cat_r2    = best_adj_r2
+                    best_cat_delta = None
+                    best_cat_key   = None
+                    for cat_feat in self.categorical_features:
+                        cat_val = str(row.get(cat_feat, '')).strip()
+                        if not cat_val or cat_val == 'nan':
+                            continue
+                        mkey  = f'Historic Direct × Fleet YoY Trend ({cat_feat}={cat_val})'
+                        minfo = self.stat_methods.get(mkey, {})
+                        mr2   = minfo.get('effective_r2', 0.0)
+                        mdelta = minfo.get('_fleet_yoy_delta')
+                        if mdelta is not None and mr2 > best_cat_r2:
+                            best_cat_r2    = mr2
+                            best_cat_delta = mdelta
+                            best_cat_key   = mkey
+                    if best_cat_delta is not None:
+                        anchor        = float(hval) * best_cat_delta
+                        anchor_method = best_cat_key
+                        anchor_r2     = best_cat_r2
+                        best_adj_r2   = best_cat_r2
+                    else:
+                        # Fall back to fleet-wide delta
+                        fleet_info  = self.stat_methods.get('Historic Direct × Fleet YoY Trend', {})
+                        fleet_r2    = fleet_info.get('effective_r2', 0.0)
+                        fleet_delta = fleet_info.get('_fleet_yoy_delta')
+                        if fleet_delta is not None and fleet_r2 > best_adj_r2:
+                            anchor        = float(hval) * fleet_delta
+                            anchor_method = 'Historic Direct × Fleet YoY Trend'
+                            anchor_r2     = fleet_r2
+                            best_adj_r2   = fleet_r2
 
                 for feat in self.numeric_features:
                     cf = row.get(feat)
@@ -1704,10 +1914,37 @@ class ExtrapolationTool:
                     anchor, anchor_method, anchor_r2 = float(cm[cv]), f'Group Mean VQ ({feat})', r2
 
             # 3b: ML models
+            # Enrich the row with _Historic_VQ and _Site so models that were
+            # trained with these features can use them at prediction time.
+            ml_row = dict(row)
+            ml_row['_Site'] = site
+
+            # Compute _Historic_VQ for this blank row using same timeframe logic
+            # as _build_ml_features
+            ckey_hist = self._composite_key(row)
+            hist_data = self.historic_vq.get(ckey_hist, {})
+            if hist_data:
+                if tf == 'Monthly' and month:
+                    if month in hist_data:
+                        ml_row['_Historic_VQ'] = float(hist_data[month])
+                    elif 'ANNUAL' in hist_data:
+                        ml_row['_Historic_VQ'] = float(hist_data['ANNUAL']) / 12.0
+                    else:
+                        month_vals = [v for k, v in hist_data.items() if k != 'ANNUAL']
+                        ml_row['_Historic_VQ'] = float(np.mean(month_vals)) if month_vals else np.nan
+                else:
+                    if 'ANNUAL' in hist_data:
+                        ml_row['_Historic_VQ'] = float(hist_data['ANNUAL'])
+                    else:
+                        month_vals = [v for k, v in hist_data.items() if k != 'ANNUAL']
+                        ml_row['_Historic_VQ'] = float(sum(month_vals)) if month_vals else np.nan
+            else:
+                ml_row['_Historic_VQ'] = np.nan
+
             for name, info in self.ml_models.items():
                 if tf == 'Annual' and '_Month' in info['features']:
                     continue
-                pred = self._apply_ml_level(info, row)
+                pred = self._apply_ml_level(info, ml_row)
                 if pred is None:
                     continue
                 r2 = info['r2'] or 0.0
@@ -1747,9 +1984,15 @@ class ExtrapolationTool:
         if prediction is None:
             return float(self.known[self.vq_col].mean()), 'Fleet Overall Average', 0.0
 
-        # Strip '× Seasonal' from method name for annual rows — factor was 1.0
-        if not month and anchor_method and '× Seasonal' in anchor_method:
-            anchor_method = anchor_method.replace(' × Seasonal', '')
+        # Update method name to reflect whether seasonal factor was actually applied
+        if anchor_method:
+            seasonal_was_applied = month and sf != 1.0
+            if seasonal_was_applied and '× Seasonal' not in anchor_method:
+                # Seasonal factor changed the number — add × Seasonal to name
+                anchor_method = anchor_method + ' × Seasonal'
+            elif not month and '× Seasonal' in anchor_method:
+                # Annual row — seasonal factor was 1.0 — strip from name
+                anchor_method = anchor_method.replace(' × Seasonal', '')
 
         return prediction, anchor_method, anchor_r2
 
