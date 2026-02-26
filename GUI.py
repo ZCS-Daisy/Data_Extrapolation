@@ -691,16 +691,10 @@ class ExtrapolationGUI:
         if not path:
             return
         try:
-            df = pd.DataFrame({
-                'Site identifier': ['SITE001', 'SITE001', 'SITE002'],
-                'Location':        ['London, UK', 'London, UK', 'Manchester, UK'],
-                'Date from':       ['01/01/2025', '01/02/2025', '01/01/2025'],
-                'Date to':         ['31/01/2025', '28/02/2025', '31/01/2025'],
-                'GHG Category':    ['Electricity', 'Electricity', 'Electricity'],
-                'Volumetric Quantity': [12000, '', 9500],
-                'Turnover':        [500000, 520000, 430000],
-                'Brand':           ['Brand A', 'Brand A', 'Brand B'],
-            })
+            df = pd.DataFrame(columns=[
+                'Site identifier', 'Location', 'Date from', 'Date to',
+                'GHG Category', 'GHG Sub Category', 'Volumetric Quantity',
+            ])
             if path.endswith('.csv'):
                 df.to_csv(path, index=False)
             else:
@@ -708,9 +702,7 @@ class ExtrapolationGUI:
             self.input_file_path.set(path)
             self._reset_features()
             print(f"\n✓ Input template exported: {path}")
-            if messagebox.askyesno('Template Exported',
-                                   f'Template saved to:\n{path}\n\nOpen it now?'):
-                os.startfile(path)
+            os.startfile(path)
         except Exception as e:
             messagebox.showerror('Error', f'Could not export template: {e}')
 
@@ -722,22 +714,17 @@ class ExtrapolationGUI:
         if not path:
             return
         try:
-            df = pd.DataFrame({
-                'Site identifier': ['SITE001', 'SITE001', 'SITE002'],
-                'Date from':       ['01/01/2024', '01/02/2024', '01/01/2024'],
-                'Date to':         ['31/01/2024', '28/02/2024', '31/01/2024'],
-                'GHG Category':    ['Electricity', 'Electricity', 'Electricity'],
-                'Volumetric Quantity': [11000, 10500, 8800],
-            })
+            df = pd.DataFrame(columns=[
+                'Site identifier', 'Date from', 'Date to',
+                'GHG Category', 'GHG Sub Category', 'Volumetric Quantity',
+            ])
             if path.endswith('.csv'):
                 df.to_csv(path, index=False)
             else:
                 df.to_excel(path, index=False)
             self.historic_records_path.set(path)
             print(f"\n✓ Historic records template exported: {path}")
-            if messagebox.askyesno('Template Exported',
-                                   f'Template saved to:\n{path}\n\nOpen it now?'):
-                os.startfile(path)
+            os.startfile(path)
         except Exception as e:
             messagebox.showerror('Error', f'Could not export template: {e}')
 
@@ -749,22 +736,16 @@ class ExtrapolationGUI:
         if not path:
             return
         try:
-            df = pd.DataFrame({
-                'Site identifier': ['SITE001', 'SITE002'],
-                'Date from':       ['01/01/2024', '01/01/2024'],
-                'Date to':         ['31/12/2024', '31/12/2024'],
-                'Turnover':        [6000000, 5200000],
-                'Brand':           ['Brand A', 'Brand B'],
-            })
+            df = pd.DataFrame(columns=[
+                'Site identifier', 'Date from', 'Date to',
+            ])
             if path.endswith('.csv'):
                 df.to_csv(path, index=False)
             else:
                 df.to_excel(path, index=False)
             self.historic_features_path.set(path)
             print(f"\n✓ Historic features template exported: {path}")
-            if messagebox.askyesno('Template Exported',
-                                   f'Template saved to:\n{path}\n\nOpen it now?'):
-                os.startfile(path)
+            os.startfile(path)
         except Exception as e:
             messagebox.showerror('Error', f'Could not export template: {e}')
 

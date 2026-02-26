@@ -1747,6 +1747,10 @@ class ExtrapolationTool:
         if prediction is None:
             return float(self.known[self.vq_col].mean()), 'Fleet Overall Average', 0.0
 
+        # Strip '× Seasonal' from method name for annual rows — factor was 1.0
+        if not month and anchor_method and '× Seasonal' in anchor_method:
+            anchor_method = anchor_method.replace(' × Seasonal', '')
+
         return prediction, anchor_method, anchor_r2
 
         for fc in info['features']:
